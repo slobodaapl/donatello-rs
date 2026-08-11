@@ -25,7 +25,14 @@ impl SimulationState {
     }
 
     pub fn from_macro(settings: &Settings, actions: &[Action]) -> Result<Self, ActionError> {
-        let mut state = Self::new(settings);
+        Self::from_macro_from_state(settings, Self::new(settings), actions)
+    }
+
+    pub fn from_macro_from_state(
+        settings: &Settings,
+        mut state: Self,
+        actions: &[Action],
+    ) -> Result<Self, ActionError> {
         for action in actions {
             state = state.use_action(*action, Condition::Normal, settings)?;
         }

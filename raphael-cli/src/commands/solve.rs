@@ -64,6 +64,10 @@ pub struct SolveArgs {
     #[arg(long, default_value_t = false)]
     pub quick_innovation: bool,
 
+    /// Available Crafter's Delineations shared by specialist actions
+    #[arg(long)]
+    pub crafter_delineations: Option<u8>,
+
     /// Set the maximum number of Stellar Steady Hand uses
     #[arg(long)]
     pub stellar_steady_hand: Option<u8>,
@@ -354,7 +358,14 @@ pub fn execute(args: &SolveArgs) {
         Box::new(|_| {}),
         AtomicFlag::new(),
     );
-    let actions = match solver.solve() {
+    let mut initial_state = SimulationState::new(&settings);
+    let default_delineations = u8::from(args.heart_and_soul) + u8::from(args.quick_innovation);
+    initial_state.effects.set_crafter_delineations(
+        args.crafter_delineations
+            .unwrap_or(default_delineations)
+            .min(default_delineations),
+    );
+    let actions = match solver.solve_from_state(initial_state) {
         Ok(actions) => actions,
         Err(error) => {
             eprintln!("NO_SOLUTION: {error:?}");
@@ -362,7 +373,8 @@ pub fn execute(args: &SolveArgs) {
         }
     };
 
-    let final_state = SimulationState::from_macro(&settings, &actions).unwrap();
+    let final_state =
+        SimulationState::from_macro_from_state(&settings, initial_state, &actions).unwrap();
     let state_quality = final_state.quality;
     let final_quality = state_quality.saturating_add(initial_quality);
     let steps = actions.len();

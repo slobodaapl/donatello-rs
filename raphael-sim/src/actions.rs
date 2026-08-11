@@ -875,10 +875,16 @@ impl ActionImpl for HeartAndSoul {
         _settings: &Settings,
         _condition: Condition,
     ) -> Result<(), ActionError> {
-        if !state.effects.heart_and_soul_available() {
+        if !state.effects.heart_and_soul_available() || state.effects.crafter_delineations() == 0 {
             return Err(ActionError::NoRemainingUses);
         }
         Ok(())
+    }
+
+    fn transform(state: &mut SimulationState, _settings: &Settings, _condition: Condition) {
+        state
+            .effects
+            .set_crafter_delineations(state.effects.crafter_delineations().saturating_sub(1));
     }
 }
 
@@ -1010,13 +1016,21 @@ impl ActionImpl for QuickInnovation {
     ) -> Result<(), ActionError> {
         if state.effects.innovation() != 0 {
             Err(ActionError::SpecialConditionNotMet)
-        } else if !state.effects.quick_innovation_available() {
+        } else if !state.effects.quick_innovation_available()
+            || state.effects.crafter_delineations() == 0
+        {
             Err(ActionError::NoRemainingUses)
         } else if !state.effects.quality_actions_allowed() {
             Err(ActionError::QualityAfterProgress)
         } else {
             Ok(())
         }
+    }
+
+    fn transform(state: &mut SimulationState, _settings: &Settings, _condition: Condition) {
+        state
+            .effects
+            .set_crafter_delineations(state.effects.crafter_delineations().saturating_sub(1));
     }
 }
 

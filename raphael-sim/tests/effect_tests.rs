@@ -71,7 +71,8 @@ fn test_expedience() {
     let initial_state = SimulationState {
         effects: Effects::new()
             .with_expedience(true)
-            .with_heart_and_soul_available(true),
+            .with_heart_and_soul_available(true)
+            .with_crafter_delineations(1),
         ..SimulationState::new(&SETTINGS)
     };
     // Expedience goes away after using an action.
@@ -101,4 +102,24 @@ fn test_synthesis_begin() {
     )
     .unwrap();
     assert_eq!(state.effects.muscle_memory(), 5);
+}
+
+#[test]
+fn specialist_actions_share_crafter_delineations() {
+    let initial_state = SimulationState {
+        effects: Effects::new()
+            .with_special_quality_state(SpecialQualityState::Normal)
+            .with_heart_and_soul_available(true)
+            .with_quick_innovation_available(true)
+            .with_crafter_delineations(1),
+        ..SimulationState::new(&SETTINGS)
+    };
+    let after_quick_innovation = initial_state
+        .use_action(Action::QuickInnovation, Condition::Normal, &SETTINGS)
+        .unwrap();
+    assert_eq!(after_quick_innovation.effects.crafter_delineations(), 0);
+    assert_eq!(
+        after_quick_innovation.use_action(Action::HeartAndSoul, Condition::Normal, &SETTINGS),
+        Err(ActionError::NoRemainingUses)
+    );
 }

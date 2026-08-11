@@ -9,7 +9,7 @@ use raphael_sim::{
 use raphael_solver::{AtomicFlag, MacroSolver, SolverSettings};
 use serde::{Deserialize, Serialize};
 
-const ABI_VERSION: u32 = 1;
+const ABI_VERSION: u32 = 2;
 const MAX_CACHED_SOLVERS: usize = 8;
 
 type CachedSolver = Arc<Mutex<MacroSolver<'static>>>;
@@ -56,6 +56,7 @@ struct RootState {
     trained_perfection_available: bool,
     expedience: bool,
     condition: u8,
+    crafter_delineations: u8,
 }
 
 #[derive(Serialize)]
@@ -114,6 +115,7 @@ fn build_state(root: &RootState, backload_progress: bool) -> Result<SimulationSt
         .with_trained_perfection_active(root.trained_perfection_active)
         .with_trained_perfection_available(root.trained_perfection_available)
         .with_expedience(root.expedience);
+    let effects = effects.with_crafter_delineations(root.crafter_delineations.min(2));
     Ok(SimulationState {
         cp: root.cp,
         durability: root.durability,
@@ -286,7 +288,7 @@ mod tests {
 
     fn request(condition: u8) -> Vec<u8> {
         format!(
-            r#"{{"abiVersion":1,"maxCp":500,"maxDurability":40,"maxProgress":500,"maxQuality":500,"baseProgress":100,"baseQuality":100,"jobLevel":100,"manipulation":true,"specialist":false,"backloadProgress":false,"root":{{"cp":500,"durability":40,"progress":0,"quality":0,"innerQuiet":0,"wasteNot":0,"manipulation":0,"innovation":0,"veneration":0,"greatStrides":0,"muscleMemory":0,"finalAppraisal":0,"carefulObservationCharges":0,"combo":3,"heartAndSoulActive":false,"heartAndSoulAvailable":false,"quickInnovationAvailable":false,"trainedPerfectionActive":false,"trainedPerfectionAvailable":true,"expedience":false,"condition":{condition}}}}}"#
+            r#"{{"abiVersion":2,"maxCp":500,"maxDurability":40,"maxProgress":500,"maxQuality":500,"baseProgress":100,"baseQuality":100,"jobLevel":100,"manipulation":true,"specialist":false,"backloadProgress":false,"root":{{"cp":500,"durability":40,"progress":0,"quality":0,"innerQuiet":0,"wasteNot":0,"manipulation":0,"innovation":0,"veneration":0,"greatStrides":0,"muscleMemory":0,"finalAppraisal":0,"carefulObservationCharges":0,"combo":3,"heartAndSoulActive":false,"heartAndSoulAvailable":false,"quickInnovationAvailable":false,"trainedPerfectionActive":false,"trainedPerfectionAvailable":true,"expedience":false,"condition":{condition},"crafterDelineations":0}}}}"#
         )
         .into_bytes()
     }
@@ -309,7 +311,17 @@ mod tests {
 
     #[test]
     fn abi_version_is_stable() {
-        assert_eq!(donatello_abi_version(), 1);
+        assert_eq!(donatello_abi_version(), 2);
+    }
+
+    #[test]
+    fn camel_case_v2_request_preserves_shared_specialist_resource() {
+        let mut request: SolveRequest = serde_json::from_slice(&request(0)).unwrap();
+        request.root.crafter_delineations = 1;
+        request.root.heart_and_soul_available = true;
+        request.root.quick_innovation_available = true;
+        let state = build_state(&request.root, false).unwrap();
+        assert_eq!(state.effects.crafter_delineations(), 1);
     }
 
     #[test]

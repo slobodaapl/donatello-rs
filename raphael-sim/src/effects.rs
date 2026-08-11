@@ -45,7 +45,11 @@ pub struct Effects {
     /// Combo effect from Hasty Touch that enables usage of Daring Touch.
     pub expedience: bool,
 
-    #[bits(15)]
+    #[bits(3)]
+    /// Remaining Crafter's Delineations shared by specialist actions.
+    pub crafter_delineations: u8,
+
+    #[bits(12)]
     pub _padding: u32,
 }
 
@@ -66,6 +70,10 @@ impl Effects {
             )
             .with_quick_innovation_available(
                 settings.is_action_allowed::<crate::actions::QuickInnovation>(),
+            )
+            .with_crafter_delineations(
+                u8::from(settings.is_action_allowed::<crate::actions::HeartAndSoul>())
+                    + u8::from(settings.is_action_allowed::<crate::actions::QuickInnovation>()),
             )
             .with_combo(Combo::SynthesisBegin)
             .with_stellar_steady_hand_charges(settings.stellar_steady_hand_charges)
