@@ -123,8 +123,19 @@ impl SimulationState {
                 .set_inner_quiet(std::cmp::min(10, state.effects.inner_quiet() + 1));
         }
 
-        let progress_increase = A::progress_increase(self, settings);
+        let progress_increase = match condition {
+            Condition::Malleable => A::progress_increase(self, settings).saturating_mul(3) / 2,
+            _ => A::progress_increase(self, settings),
+        };
         state.progress = state.progress.saturating_add(progress_increase);
+
+        if progress_increase != 0
+            && state.progress >= settings.max_progress
+            && self.effects.final_appraisal() != 0
+        {
+            state.progress = settings.max_progress.saturating_sub(1);
+            state.effects.set_final_appraisal(0);
+        }
 
         if state.is_final(settings) {
             return Ok(state);
@@ -151,6 +162,45 @@ impl SimulationState {
 
         state.effects =
             Effects::from_bits(state.effects.into_bits() | A::EFFECT_SET_MASK.into_bits());
+
+        if condition == Condition::Primed {
+            let set = A::EFFECT_SET_MASK;
+            if set.waste_not() != 0 {
+                state
+                    .effects
+                    .set_waste_not(state.effects.waste_not().saturating_add(2));
+            }
+            if set.innovation() != 0 {
+                state
+                    .effects
+                    .set_innovation(state.effects.innovation().saturating_add(2));
+            }
+            if set.veneration() != 0 {
+                state
+                    .effects
+                    .set_veneration(state.effects.veneration().saturating_add(2));
+            }
+            if set.great_strides() != 0 {
+                state
+                    .effects
+                    .set_great_strides(state.effects.great_strides().saturating_add(2));
+            }
+            if set.muscle_memory() != 0 {
+                state
+                    .effects
+                    .set_muscle_memory(state.effects.muscle_memory().saturating_add(2));
+            }
+            if set.manipulation() != 0 {
+                state
+                    .effects
+                    .set_manipulation(state.effects.manipulation().saturating_add(2));
+            }
+            if set.final_appraisal() != 0 {
+                state
+                    .effects
+                    .set_final_appraisal(state.effects.final_appraisal().saturating_add(2));
+            }
+        }
 
         if progress_increase != 0 && settings.backload_progress {
             state.effects = state.effects.strip_quality_effects();
@@ -224,6 +274,7 @@ impl SimulationState {
             Action::RapidSynthesis => self.use_action_impl::<RapidSynthesis>(settings, condition),
             Action::HastyTouch => self.use_action_impl::<HastyTouch>(settings, condition),
             Action::DaringTouch => self.use_action_impl::<DaringTouch>(settings, condition),
+            Action::FinalAppraisal => self.use_action_impl::<FinalAppraisal>(settings, condition),
         }
     }
 }

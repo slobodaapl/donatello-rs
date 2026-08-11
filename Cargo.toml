@@ -6,6 +6,8 @@ members = [
     "raphael-data-updater",
     "raphael-cli",
     "raphael-translations",
+    "donatello-ffi",
+    "donatello-bench",
 ]
 resolver = "2"
 
@@ -79,7 +81,7 @@ opt-level = 3
 lto = "fat"
 overflow-checks = false
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 
 [profile.release.package.egui]
 opt-level = "s"

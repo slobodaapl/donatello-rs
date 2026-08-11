@@ -55,12 +55,14 @@ impl ActionMask {
         Self { mask: u64::MAX }
     }
 
-    /// Excludes TrainedEye and specialist actions
+    /// Existing Raphael default action set. Donatello-only extensions are opt-in so
+    /// ordinary Raphael solves retain their established behavior.
     pub const fn regular() -> Self {
         Self::all()
             .remove(Action::TrainedEye)
             .remove(Action::HeartAndSoul)
             .remove(Action::QuickInnovation)
+            .remove(Action::FinalAppraisal)
     }
 
     pub const fn has(self, action: Action) -> bool {

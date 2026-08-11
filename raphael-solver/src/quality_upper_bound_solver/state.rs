@@ -63,6 +63,12 @@ impl ReducedState {
             state
                 .effects
                 .with_great_strides(if great_strides_active { 3 } else { 0 })
+                // Final Appraisal cannot increase attainable quality. Ignoring it is a
+                // conservative relaxation and avoids adding a zero-step cycle to this DP.
+                .with_final_appraisal(0)
+                // Careful Observation is intentionally absent from deterministic search;
+                // its remaining charges therefore cannot affect this upper bound.
+                .with_careful_observation_charges(0)
         };
         Some(Self {
             cp,
@@ -101,7 +107,10 @@ impl ReducedState {
     ) -> Option<(Self, u16, u16)> {
         match action {
             ActionCombo::Single(
-                Action::MasterMend | Action::ImmaculateMend | Action::Manipulation,
+                Action::MasterMend
+                | Action::ImmaculateMend
+                | Action::Manipulation
+                | Action::FinalAppraisal,
             ) => None,
             _ => {
                 let state = self.to_simulation_state(settings);

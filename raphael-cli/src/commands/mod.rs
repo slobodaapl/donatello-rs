@@ -4,6 +4,7 @@ pub mod ingredients;
 pub mod search_mission;
 pub mod search_recipe;
 pub mod solve;
+pub mod solve_live;
 
 #[derive(Copy, Clone, clap::ValueEnum, Debug)]
 pub enum Language {

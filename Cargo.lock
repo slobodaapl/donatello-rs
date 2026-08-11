@@ -1082,6 +1082,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "donatello-bench"
+version = "0.1.0"
+dependencies = [
+ "raphael-sim",
+ "raphael-solver",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "donatello-ffi"
+version = "0.1.0"
+dependencies = [
+ "raphael-sim",
+ "raphael-solver",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "downcast-rs"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3573,6 +3593,7 @@ name = "raphael-cli"
 version = "0.2.2"
 dependencies = [
  "clap",
+ "donatello-ffi",
  "env_logger",
  "log",
  "raphael-data",

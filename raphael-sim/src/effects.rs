@@ -11,12 +11,16 @@ pub struct Effects {
     pub innovation: u8,
     #[bits(3)]
     pub veneration: u8,
-    #[bits(2)]
+    #[bits(3)]
     pub great_strides: u8,
     #[bits(3)]
     pub muscle_memory: u8,
     #[bits(4)]
     pub manipulation: u8,
+    #[bits(3)]
+    pub final_appraisal: u8,
+    #[bits(2)]
+    pub careful_observation_charges: u8,
 
     pub trained_perfection_available: bool,
     pub heart_and_soul_available: bool,
@@ -41,7 +45,7 @@ pub struct Effects {
     /// Combo effect from Hasty Touch that enables usage of Daring Touch.
     pub expedience: bool,
 
-    #[bits(21)]
+    #[bits(15)]
     pub _padding: u32,
 }
 
@@ -113,6 +117,8 @@ impl Effects {
             .with_great_strides(0)
             .with_expedience(false)
             .with_quick_innovation_available(false)
+            .with_final_appraisal(0)
+            .with_careful_observation_charges(0)
     }
 }
 
@@ -123,6 +129,7 @@ const EFFECTS_BIT_0: u64 = Effects::new()
     .with_great_strides(1)
     .with_muscle_memory(1)
     .with_manipulation(1)
+    .with_final_appraisal(1)
     .with_stellar_steady_hand(1)
     .with_expedience(true)
     .into_bits();

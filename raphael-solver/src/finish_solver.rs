@@ -66,6 +66,13 @@ pub struct FinishSolver {
     cp_for_guaranteed_finish: Option<u16>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Finishability {
+    Proven,
+    Impossible,
+    Unknown,
+}
+
 impl FinishSolver {
     pub fn new(settings: SolverSettings) -> Self {
         Self {
@@ -76,31 +83,40 @@ impl FinishSolver {
     }
 
     /// Calling this method before calling `FinishSolver::precompute` will return a `SolverException`.
-    pub fn can_finish(&self, state: &SimulationState) -> Result<bool, SolverException> {
+    pub(crate) fn can_finish(
+        &self,
+        state: &SimulationState,
+    ) -> Result<Finishability, SolverException> {
         if let Some(required_cp) = self.cp_for_guaranteed_finish
             && required_cp <= state.cp
         {
-            return Ok(true);
+            return Ok(Finishability::Proven);
         }
         let key = (state.durability, state.effects.strip_quality_effects());
-        let breakpoints = self.solved_states.get(&key).ok_or_else(|| {
-            internal_error!(
-                "State not found in FinishSolver solved states.",
-                self.settings,
-                state
-            )
-        })?;
-        let max_additional_progress = breakpoints.get_progress(state.cp).ok_or_else(|| {
-            internal_error!(
-                "State found in FinishSolver solved states but with not enough CP.",
-                self.settings,
-                state
-            )
-        })?;
-        Ok(state.progress.saturating_add(max_additional_progress) >= self.settings.max_progress())
+        // Arbitrary live roots can contain effect durations/combinations absent from the
+        // canonical template graph (notably Primed-derived durations). A missing bound is
+        // not evidence of non-finishability; conservatively retain the search state.
+        let Some(breakpoints) = self.solved_states.get(&key) else {
+            return Ok(Finishability::Unknown);
+        };
+        let Some(max_additional_progress) = breakpoints.get_progress(state.cp) else {
+            return Ok(Finishability::Unknown);
+        };
+        Ok(
+            if state.progress.saturating_add(max_additional_progress)
+                >= self.settings.max_progress()
+            {
+                Finishability::Proven
+            } else {
+                Finishability::Impossible
+            },
+        )
     }
 
     pub fn precompute(&mut self) -> Result<(), SolverException> {
+        if !self.solved_states.is_empty() {
+            return Ok(());
+        }
         let mut templates = generate_templates(&self.settings);
         while !templates.is_empty() {
             templates

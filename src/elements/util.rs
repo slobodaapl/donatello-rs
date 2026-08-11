@@ -217,6 +217,7 @@ pub fn get_action_icon(action: Action, job_id: u8) -> egui::Image<'static> {
         Action::Veneration => action_icon!("Veneration", job_id),
         Action::StandardTouch => action_icon!("Standard Touch", job_id),
         Action::GreatStrides => action_icon!("Great Strides", job_id),
+        Action::FinalAppraisal => action_icon!("Final Appraisal", job_id),
         Action::Innovation => action_icon!("Innovation", job_id),
         Action::WasteNot2 => action_icon!("Waste Not II", job_id),
         Action::ByregotsBlessing => action_icon!("Byregot's Blessing", job_id),

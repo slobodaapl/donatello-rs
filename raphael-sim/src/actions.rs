@@ -42,24 +42,37 @@ pub trait ActionImpl {
             Condition::Good => 3,
             Condition::Excellent => 8,
             Condition::Poor => 1,
+            Condition::Centered
+            | Condition::Sturdy
+            | Condition::Pliant
+            | Condition::Malleable
+            | Condition::Primed
+            | Condition::GoodOmen => 2,
         };
         let quality =
             u32::from(settings.base_quality) * action_mod * effect_mod * condition_mod / 20000;
         quality.try_into().unwrap_or(u16::MAX)
     }
 
-    fn durability_cost(state: &SimulationState, settings: &Settings, _condition: Condition) -> u16 {
+    fn durability_cost(state: &SimulationState, settings: &Settings, condition: Condition) -> u16 {
         if state.effects.trained_perfection_active() {
             return 0;
         }
-        match state.effects.waste_not() {
+        let cost = match state.effects.waste_not() {
             0 => Self::base_durability_cost(state, settings),
             _ => Self::base_durability_cost(state, settings).div_ceil(2),
+        };
+        match condition {
+            Condition::Sturdy => cost.div_ceil(2),
+            _ => cost,
         }
     }
 
-    fn cp_cost(state: &SimulationState, settings: &Settings, _condition: Condition) -> u16 {
-        Self::base_cp_cost(state, settings)
+    fn cp_cost(state: &SimulationState, settings: &Settings, condition: Condition) -> u16 {
+        match condition {
+            Condition::Pliant => Self::base_cp_cost(state, settings).div_ceil(2),
+            _ => Self::base_cp_cost(state, settings),
+        }
     }
 
     fn progress_modifier(_state: &SimulationState, _settings: &Settings) -> u32 {
@@ -158,6 +171,20 @@ impl ActionImpl for MasterMend {
 pub struct Observe {}
 impl Observe {
     pub const CP_COST: u16 = 7;
+}
+
+pub struct FinalAppraisal {}
+impl ActionImpl for FinalAppraisal {
+    const LEVEL_REQUIREMENT: u8 = 42;
+    const ACTION_MASK: ActionMask = ActionMask::none().add(Action::FinalAppraisal);
+    const INCREASES_STEP_COUNT: bool = false;
+
+    const EFFECT_RESET_MASK: Effects = DEFAULT_EFFECT_RESET_MASK.with_final_appraisal(0);
+    const EFFECT_SET_MASK: Effects = Effects::new().with_final_appraisal(5);
+
+    fn base_cp_cost(_state: &SimulationState, _settings: &Settings) -> u16 {
+        1
+    }
 }
 impl ActionImpl for Observe {
     const LEVEL_REQUIREMENT: u8 = 13;
@@ -1075,11 +1102,10 @@ impl ActionImpl for RapidSynthesis {
     fn precondition(
         state: &SimulationState,
         _settings: &Settings,
-        _condition: Condition,
+        condition: Condition,
     ) -> Result<(), ActionError> {
         // Only actions with 100% success rate are supported.
-        // Stellar Steady Hand is the only way to achieve 100% success rate with Rapid Synthesis.
-        if state.effects.stellar_steady_hand() == 0 {
+        if Action::RapidSynthesis.success_rate(state, condition) < 100 {
             return Err(ActionError::UnreliableAction);
         }
         Ok(())
@@ -1110,11 +1136,10 @@ impl ActionImpl for HastyTouch {
     fn precondition(
         state: &SimulationState,
         _settings: &Settings,
-        _condition: Condition,
+        condition: Condition,
     ) -> Result<(), ActionError> {
         // Only actions with 100% success rate are supported.
-        // Stellar Steady Hand is the only way to achieve 100% success rate with Rapid Synthesis.
-        if state.effects.stellar_steady_hand() == 0 {
+        if Action::HastyTouch.success_rate(state, condition) < 100 {
             return Err(ActionError::UnreliableAction);
         }
         if state.effects.expedience() {
@@ -1152,11 +1177,10 @@ impl ActionImpl for DaringTouch {
     fn precondition(
         state: &SimulationState,
         _settings: &Settings,
-        _condition: Condition,
+        condition: Condition,
     ) -> Result<(), ActionError> {
         // Only actions with 100% success rate are supported.
-        // Stellar Steady Hand is the only way to achieve 100% success rate with Rapid Synthesis.
-        if state.effects.stellar_steady_hand() == 0 {
+        if Action::DaringTouch.success_rate(state, condition) < 100 {
             return Err(ActionError::UnreliableAction);
         }
         if !state.effects.expedience() {
@@ -1251,6 +1275,7 @@ pub enum Action {
     RapidSynthesis,
     HastyTouch,
     DaringTouch,
+    FinalAppraisal,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -1282,6 +1307,65 @@ impl Combo {
 }
 
 impl Action {
+    pub fn success_rate(self, state: &SimulationState, condition: Condition) -> u8 {
+        let base: u8 = match self {
+            Self::RapidSynthesis => 50,
+            Self::HastyTouch | Self::DaringTouch => 60,
+            _ => 100,
+        };
+        if base < 100 && state.effects.stellar_steady_hand() != 0 {
+            100
+        } else {
+            base.saturating_add(if condition == Condition::Centered {
+                25
+            } else {
+                0
+            })
+            .min(100)
+        }
+    }
+
+    pub const fn increases_step_count(self) -> bool {
+        match self {
+            Self::BasicSynthesis => BasicSynthesis::INCREASES_STEP_COUNT,
+            Self::BasicTouch => BasicTouch::INCREASES_STEP_COUNT,
+            Self::MasterMend => MasterMend::INCREASES_STEP_COUNT,
+            Self::Observe => Observe::INCREASES_STEP_COUNT,
+            Self::TricksOfTheTrade => TricksOfTheTrade::INCREASES_STEP_COUNT,
+            Self::WasteNot => WasteNot::INCREASES_STEP_COUNT,
+            Self::Veneration => Veneration::INCREASES_STEP_COUNT,
+            Self::StandardTouch => StandardTouch::INCREASES_STEP_COUNT,
+            Self::GreatStrides => GreatStrides::INCREASES_STEP_COUNT,
+            Self::Innovation => Innovation::INCREASES_STEP_COUNT,
+            Self::WasteNot2 => WasteNot2::INCREASES_STEP_COUNT,
+            Self::ByregotsBlessing => ByregotsBlessing::INCREASES_STEP_COUNT,
+            Self::PreciseTouch => PreciseTouch::INCREASES_STEP_COUNT,
+            Self::MuscleMemory => MuscleMemory::INCREASES_STEP_COUNT,
+            Self::CarefulSynthesis => CarefulSynthesis::INCREASES_STEP_COUNT,
+            Self::Manipulation => Manipulation::INCREASES_STEP_COUNT,
+            Self::PrudentTouch => PrudentTouch::INCREASES_STEP_COUNT,
+            Self::AdvancedTouch => AdvancedTouch::INCREASES_STEP_COUNT,
+            Self::Reflect => Reflect::INCREASES_STEP_COUNT,
+            Self::PreparatoryTouch => PreparatoryTouch::INCREASES_STEP_COUNT,
+            Self::Groundwork => Groundwork::INCREASES_STEP_COUNT,
+            Self::DelicateSynthesis => DelicateSynthesis::INCREASES_STEP_COUNT,
+            Self::IntensiveSynthesis => IntensiveSynthesis::INCREASES_STEP_COUNT,
+            Self::TrainedEye => TrainedEye::INCREASES_STEP_COUNT,
+            Self::HeartAndSoul => HeartAndSoul::INCREASES_STEP_COUNT,
+            Self::PrudentSynthesis => PrudentSynthesis::INCREASES_STEP_COUNT,
+            Self::TrainedFinesse => TrainedFinesse::INCREASES_STEP_COUNT,
+            Self::RefinedTouch => RefinedTouch::INCREASES_STEP_COUNT,
+            Self::QuickInnovation => QuickInnovation::INCREASES_STEP_COUNT,
+            Self::ImmaculateMend => ImmaculateMend::INCREASES_STEP_COUNT,
+            Self::TrainedPerfection => TrainedPerfection::INCREASES_STEP_COUNT,
+            Self::StellarSteadyHand => StellarSteadyHand::INCREASES_STEP_COUNT,
+            Self::RapidSynthesis => RapidSynthesis::INCREASES_STEP_COUNT,
+            Self::HastyTouch => HastyTouch::INCREASES_STEP_COUNT,
+            Self::DaringTouch => DaringTouch::INCREASES_STEP_COUNT,
+            Self::FinalAppraisal => FinalAppraisal::INCREASES_STEP_COUNT,
+        }
+    }
+
     pub const fn time_cost(self) -> u8 {
         match self {
             Self::BasicSynthesis => 3,
@@ -1319,6 +1403,7 @@ impl Action {
             Self::RapidSynthesis => 3,
             Self::HastyTouch => 3,
             Self::DaringTouch => 3,
+            Self::FinalAppraisal => 3,
         }
     }
 
@@ -1359,6 +1444,7 @@ impl Action {
             Self::RapidSynthesis => 100363,
             Self::HastyTouch => 100355,
             Self::DaringTouch => 100451,
+            Self::FinalAppraisal => 19012,
         }
     }
 }

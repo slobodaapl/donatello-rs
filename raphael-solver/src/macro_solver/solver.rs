@@ -3,8 +3,10 @@ use raphael_sim::*;
 use rayon::prelude::*;
 
 use super::search_queue::{SearchQueueStats, SearchScore};
-use crate::actions::{ActionCombo, FULL_SEARCH_ACTIONS, use_action_combo};
-use crate::finish_solver::FinishSolverStats;
+use crate::actions::{
+    ActionCombo, FULL_SEARCH_ACTIONS, use_action_combo, use_action_combo_with_condition,
+};
+use crate::finish_solver::{FinishSolverStats, Finishability};
 use crate::macro_solver::search_queue::{Batch, SearchQueue};
 use crate::quality_upper_bound_solver::{
     QualityUbSolverShard, QualityUbSolverStats, QualityUbStates,
@@ -15,6 +17,7 @@ use crate::utils::ScopedTimer;
 use crate::{FinishSolver, QualityUbSolver, SolverException, SolverSettings, StepLbSolver};
 
 use std::vec::Vec;
+use strum::IntoEnumIterator;
 
 #[derive(Clone)]
 struct Solution {
@@ -32,8 +35,8 @@ impl Solution {
     }
 }
 
-type SolutionCallback<'a> = dyn Fn(&[Action]) + 'a;
-type ProgressCallback<'a> = dyn Fn(usize) + 'a;
+type SolutionCallback<'a> = dyn Fn(&[Action]) + Send + 'a;
+type ProgressCallback<'a> = dyn Fn(usize) + Send + 'a;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MacroSolverStats {
@@ -70,6 +73,29 @@ impl<'a> MacroSolver<'a> {
     }
 
     pub fn solve(&mut self) -> Result<Vec<Action>, SolverException> {
+        self.solve_from_state(SimulationState::new(&self.settings.simulator_settings))
+    }
+
+    pub fn set_interrupt_signal(&mut self, interrupt_signal: AtomicFlag) {
+        self.interrupt_signal = interrupt_signal;
+    }
+
+    /// Solve the complete remaining synthesis from an authoritative live state.
+    /// The state's current resources, progress, quality, effects, charges, and combo are preserved.
+    pub fn solve_from_state(
+        &mut self,
+        initial_state: SimulationState,
+    ) -> Result<Vec<Action>, SolverException> {
+        self.solve_from_state_with_condition(initial_state, Condition::Normal)
+    }
+
+    /// Solve from a live state while applying the already-observed deterministic condition
+    /// prefix action-by-action. Future unknown conditions become Normal.
+    pub fn solve_from_state_with_condition(
+        &mut self,
+        initial_state: SimulationState,
+        condition: Condition,
+    ) -> Result<Vec<Action>, SolverException> {
         log::debug!(
             "rayon::current_num_threads() = {}",
             rayon::current_num_threads()
@@ -84,11 +110,11 @@ impl<'a> MacroSolver<'a> {
 
         let _total_time = ScopedTimer::new("Total Time");
 
-        let initial_state = SimulationState::new(&self.settings.simulator_settings);
-
         let timer = ScopedTimer::new("Finish Solver");
         self.finish_solver.precompute()?;
-        if !self.finish_solver.can_finish(&initial_state)? {
+        if condition == Condition::Normal
+            && self.finish_solver.can_finish(&initial_state)? == Finishability::Impossible
+        {
             self.last_solve_runtime_stats.finish_solver_stats = self.finish_solver.runtime_stats();
             return Err(SolverException::NoSolution);
         }
@@ -101,10 +127,14 @@ impl<'a> MacroSolver<'a> {
         // The StepLbSolver is only queried when a state has the potential to reach max_quality.
         // If the quality upper-bound of the initial state is less than max_quality, then no
         // subsequent state can reach max_quality, which in turn means the StepLbSolver is not needed.
-        let mut quality_ub_solver_shard = quality_ub_solver.create_shard();
-        let initial_state_quality_ub =
-            quality_ub_solver_shard.quality_upper_bound(initial_state)?;
-        quality_ub_solver.extend_solved_states(quality_ub_solver_shard.solved_states());
+        let initial_state_quality_ub = if condition == Condition::Normal {
+            let mut shard = quality_ub_solver.create_shard();
+            let result = shard.quality_upper_bound(initial_state)?;
+            quality_ub_solver.extend_solved_states(shard.solved_states());
+            result
+        } else {
+            self.settings.max_quality()
+        };
         if initial_state_quality_ub >= self.settings.max_quality() {
             let _timer = ScopedTimer::new("Step LB Solver");
             step_lb_solver.precompute()?;
@@ -112,7 +142,12 @@ impl<'a> MacroSolver<'a> {
 
         let timer = ScopedTimer::new("Search");
         let actions = self
-            .do_solve(&mut quality_ub_solver, &mut step_lb_solver, initial_state)?
+            .do_solve(
+                &mut quality_ub_solver,
+                &mut step_lb_solver,
+                initial_state,
+                condition,
+            )?
             .actions();
         drop(timer);
 
@@ -126,8 +161,9 @@ impl<'a> MacroSolver<'a> {
         quality_ub_solver: &mut QualityUbSolver<'alloc>,
         step_lb_solver: &mut StepLbSolver<'alloc>,
         state: SimulationState,
+        condition: Condition,
     ) -> Result<Solution, SolverException> {
-        let mut search_queue = SearchQueue::new(self.settings, state);
+        let mut search_queue = SearchQueue::new(self.settings, state, condition);
         let mut solution: Option<Solution> = None;
         let mut min_accepted_score = SearchScore::MIN;
 
@@ -156,8 +192,8 @@ impl<'a> MacroSolver<'a> {
                 .into_par_iter()
                 .try_fold(
                     create_worker_data,
-                    |mut worker_data, (state, backtrack_id)| {
-                        worker_data.process_state(state, score, backtrack_id)?;
+                    |mut worker_data, (state, condition, backtrack_id)| {
+                        worker_data.process_state(state, condition, score, backtrack_id)?;
                         Ok(worker_data)
                     },
                 )
@@ -288,75 +324,112 @@ impl<'main, 'alloc> WorkerData<'main, 'alloc> {
     fn process_state(
         &mut self,
         state: SimulationState,
+        condition: Condition,
         score: SearchScore,
         backtrack_id: usize,
     ) -> Result<(), SolverException> {
-        for action in FULL_SEARCH_ACTIONS {
-            if let Ok(state) = use_action_combo(self.settings, state, action) {
-                if !state.is_final(&self.settings.simulator_settings) {
-                    if !self.finish_solver.can_finish(&state)? {
-                        continue;
-                    }
-
-                    self.update_min_score(SearchScore {
-                        quality_upper_bound: std::cmp::min(
-                            state.quality,
-                            self.settings.max_quality(),
-                        ),
-                        ..SearchScore::MIN
-                    });
-
-                    let quality_upper_bound = if state.quality >= self.settings.max_quality() {
-                        self.settings.max_quality()
-                    } else {
-                        std::cmp::min(
-                            score.quality_upper_bound,
-                            self.quality_ub_solver_shard.quality_upper_bound(state)?,
-                        )
-                    };
-
-                    if !self.settings.allow_non_max_quality_solutions
-                        && quality_upper_bound < self.settings.max_quality()
-                    {
-                        continue;
-                    }
-
-                    let step_lb_hint = score
-                        .steps_lower_bound
-                        .saturating_sub(score.current_steps + action.steps());
-                    let steps_lower_bound = match quality_upper_bound >= self.settings.max_quality()
-                    {
-                        true => self
-                            .step_lb_solver_shard
-                            .step_lower_bound(state, step_lb_hint)?
-                            .saturating_add(score.current_steps + action.steps()),
-                        false => score.current_steps + action.steps(),
-                    };
-
-                    let child_score = SearchScore {
-                        quality_upper_bound,
-                        steps_lower_bound,
-                        duration_lower_bound: score.current_duration + action.duration() + 3,
-                        current_steps: score.current_steps + action.steps(),
-                        current_duration: score.current_duration + action.duration(),
-                    };
-                    self.add_candidate_state(state, child_score, action, backtrack_id);
-                } else if state.progress >= self.settings.max_progress() {
-                    let solution_score = SearchScore {
-                        quality_upper_bound: std::cmp::min(
-                            state.quality,
-                            self.settings.max_quality(),
-                        ),
-                        steps_lower_bound: score.current_steps + action.steps(),
-                        duration_lower_bound: score.current_duration + action.duration(),
-                        current_steps: score.current_steps + action.steps(),
-                        current_duration: score.current_duration + action.duration(),
-                    };
-                    self.update_min_score(solution_score);
-                    self.add_candidate_state(state, solution_score, action, backtrack_id);
+        if condition == Condition::Normal {
+            for action in FULL_SEARCH_ACTIONS {
+                if let Ok(state) = use_action_combo(self.settings, state, action) {
+                    self.process_child(state, Condition::Normal, score, action, backtrack_id)?;
+                }
+            }
+        } else {
+            // Prefix expansion uses individual actions so zero-step actions and combo transitions
+            // consume conditions exactly as the game does. Future random conditions are absent.
+            for action in Action::iter().map(ActionCombo::Single) {
+                if let Ok((state, next_condition)) =
+                    use_action_combo_with_condition(self.settings, state, action, condition)
+                {
+                    self.process_child(state, next_condition, score, action, backtrack_id)?;
                 }
             }
         }
+        Ok(())
+    }
+
+    fn process_child(
+        &mut self,
+        state: SimulationState,
+        condition: Condition,
+        score: SearchScore,
+        action: ActionCombo,
+        backtrack_id: usize,
+    ) -> Result<(), SolverException> {
+        let current_steps = score.current_steps + action.steps();
+        let current_duration = score.current_duration + action.duration();
+        if state.is_final(&self.settings.simulator_settings) {
+            if state.progress >= self.settings.max_progress() {
+                let solution_score = SearchScore {
+                    quality_upper_bound: state.quality.min(self.settings.max_quality()),
+                    steps_lower_bound: current_steps,
+                    duration_lower_bound: current_duration,
+                    current_steps,
+                    current_duration,
+                };
+                self.update_min_score(solution_score);
+                self.add_candidate_state(state, solution_score, action, backtrack_id);
+            }
+            return Ok(());
+        }
+
+        if condition != Condition::Normal {
+            // Normal-only bounds are not admissible while a special condition remains active.
+            let child_score = SearchScore {
+                quality_upper_bound: self.settings.max_quality(),
+                steps_lower_bound: current_steps,
+                duration_lower_bound: current_duration,
+                current_steps,
+                current_duration,
+            };
+            self.add_candidate_state(state, child_score, action, backtrack_id);
+            return Ok(());
+        }
+
+        let finishability = self.finish_solver.can_finish(&state)?;
+        if finishability == Finishability::Impossible {
+            return Ok(());
+        }
+
+        // Only a proven completion path makes current quality a valid global lower bound. Unknown
+        // live states must remain searchable without raising the floor from a dead-end branch.
+        if finishability == Finishability::Proven {
+            self.update_min_score(SearchScore {
+                quality_upper_bound: state.quality.min(self.settings.max_quality()),
+                ..SearchScore::MIN
+            });
+        }
+
+        let quality_upper_bound = if state.quality >= self.settings.max_quality() {
+            self.settings.max_quality()
+        } else {
+            std::cmp::min(
+                score.quality_upper_bound,
+                self.quality_ub_solver_shard.quality_upper_bound(state)?,
+            )
+        };
+        if !self.settings.allow_non_max_quality_solutions
+            && quality_upper_bound < self.settings.max_quality()
+        {
+            return Ok(());
+        }
+
+        let step_lb_hint = score.steps_lower_bound.saturating_sub(current_steps);
+        let steps_lower_bound = if quality_upper_bound >= self.settings.max_quality() {
+            self.step_lb_solver_shard
+                .step_lower_bound(state, step_lb_hint)?
+                .saturating_add(current_steps)
+        } else {
+            current_steps
+        };
+        let child_score = SearchScore {
+            quality_upper_bound,
+            steps_lower_bound,
+            duration_lower_bound: current_duration + 3,
+            current_steps,
+            current_duration,
+        };
+        self.add_candidate_state(state, child_score, action, backtrack_id);
         Ok(())
     }
 }

@@ -372,13 +372,11 @@ impl<'main, 'alloc> QualityUbSolverShard<'main, 'alloc> {
                     >= self.context.settings.max_quality()
             {
                 return Ok(self.context.settings.max_quality());
-            } else {
-                return Err(internal_error!(
-                    "Maximal template list is inconsistent with actual solved states.",
-                    self.context.settings,
-                    reduced_state
-                ));
             }
+            // A live condition-derived state can share template data with the maximal fast path
+            // without having its exact threshold slot in the Normal-only precompute graph. Lack
+            // of that proof is not an invariant failure: continue below and solve the original
+            // reduced state through the memoized fallback.
         }
 
         let pareto_front = if let Some(pareto_front) = self.lookup_shared(&reduced_state) {

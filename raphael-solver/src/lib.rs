@@ -70,7 +70,7 @@ mod macros {
     pub(crate) use internal_error;
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SolverSettings {
     pub simulator_settings: raphael_sim::Settings,
     pub allow_non_max_quality_solutions: bool,

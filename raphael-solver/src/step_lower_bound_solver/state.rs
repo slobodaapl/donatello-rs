@@ -43,6 +43,10 @@ impl ReducedState {
         effects.set_trained_perfection_available(true);
         // Same thing for QuickInnovation. Just set it to always available.
         effects.set_quick_innovation_available(true);
+        // Neither effect can reduce the minimum number of actions needed to reach the
+        // progress/quality targets. Dropping them is therefore an admissible relaxation.
+        effects.set_final_appraisal(0);
+        effects.set_careful_observation_charges(0);
 
         // Make the effects of GreatStrides and WasteNot last forever.
         // This decreases the number of unique states as now each effect only has 2 possible states

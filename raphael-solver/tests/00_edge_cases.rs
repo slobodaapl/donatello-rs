@@ -245,7 +245,7 @@ fn large_progress_quality_increase() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 76,
+                inserted_nodes: 79,
                 processed_nodes: 18,
             },
             finish_solver_stats: FinishSolverStats {

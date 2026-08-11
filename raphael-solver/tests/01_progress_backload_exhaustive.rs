@@ -197,8 +197,8 @@ fn pactmaker_3240_3130_heart_and_soul() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 7415,
-                processed_nodes: 578,
+                inserted_nodes: 20782,
+                processed_nodes: 1480,
             },
             finish_solver_stats: FinishSolverStats {
                 states: 10250,
@@ -206,8 +206,8 @@ fn pactmaker_3240_3130_heart_and_soul() {
             },
             quality_ub_stats: QualityUbSolverStats {
                 states_on_main: 1690660,
-                states_on_shards: 84618,
-                values: 27637872,
+                states_on_shards: 91815,
+                values: 27806222,
             },
             step_lb_stats: StepLbSolverStats {
                 states_on_main: 0,
@@ -473,7 +473,7 @@ fn stuffed_peppers_2_heart_and_soul() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 58975,
+                inserted_nodes: 62050,
                 processed_nodes: 3179,
             },
             finish_solver_stats: FinishSolverStats {
@@ -482,8 +482,8 @@ fn stuffed_peppers_2_heart_and_soul() {
             },
             quality_ub_stats: QualityUbSolverStats {
                 states_on_main: 1547790,
-                states_on_shards: 4,
-                values: 20676364,
+                states_on_shards: 8,
+                values: 20676368,
             },
             step_lb_stats: StepLbSolverStats {
                 states_on_main: 723616,
@@ -531,7 +531,7 @@ fn stuffed_peppers_2_quick_innovation() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 47108,
+                inserted_nodes: 49844,
                 processed_nodes: 2788,
             },
             finish_solver_stats: FinishSolverStats {
@@ -540,8 +540,8 @@ fn stuffed_peppers_2_quick_innovation() {
             },
             quality_ub_stats: QualityUbSolverStats {
                 states_on_main: 1477069,
-                states_on_shards: 10,
-                values: 17827208,
+                states_on_shards: 15,
+                values: 17827213,
             },
             step_lb_stats: StepLbSolverStats {
                 states_on_main: 432530,

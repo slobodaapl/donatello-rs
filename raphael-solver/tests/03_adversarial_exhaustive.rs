@@ -102,8 +102,8 @@ fn stuffed_peppers() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 1806300,
-                processed_nodes: 85863,
+                inserted_nodes: 1894160,
+                processed_nodes: 85946,
             },
             finish_solver_stats: FinishSolverStats {
                 states: 15891,
@@ -111,13 +111,13 @@ fn stuffed_peppers() {
             },
             quality_ub_stats: QualityUbSolverStats {
                 states_on_main: 2271577,
-                states_on_shards: 19,
-                values: 39200089,
+                states_on_shards: 33,
+                values: 39200103,
             },
             step_lb_stats: StepLbSolverStats {
                 states_on_main: 366835,
-                states_on_shards: 304801,
-                values: 12131882,
+                states_on_shards: 304840,
+                values: 12132309,
             },
         }
     "#]];
@@ -218,8 +218,8 @@ fn test_mountain_chromite_ingot_no_manipulation() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 484906,
-                processed_nodes: 33166,
+                inserted_nodes: 555288,
+                processed_nodes: 35333,
             },
             finish_solver_stats: FinishSolverStats {
                 states: 798,
@@ -227,8 +227,8 @@ fn test_mountain_chromite_ingot_no_manipulation() {
             },
             quality_ub_stats: QualityUbSolverStats {
                 states_on_main: 1800421,
-                states_on_shards: 42375,
-                values: 16756721,
+                states_on_shards: 44517,
+                values: 16776217,
             },
             step_lb_stats: StepLbSolverStats {
                 states_on_main: 28922,
@@ -330,8 +330,8 @@ fn test_rare_tacos_4628_4410() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 4881826,
-                processed_nodes: 1055885,
+                inserted_nodes: 15504712,
+                processed_nodes: 2859086,
             },
             finish_solver_stats: FinishSolverStats {
                 states: 2966,
@@ -339,13 +339,13 @@ fn test_rare_tacos_4628_4410() {
             },
             quality_ub_stats: QualityUbSolverStats {
                 states_on_main: 2623346,
-                states_on_shards: 69380,
-                values: 78045032,
+                states_on_shards: 89904,
+                values: 78758579,
             },
             step_lb_stats: StepLbSolverStats {
                 states_on_main: 213458,
-                states_on_shards: 36392,
-                values: 5821840,
+                states_on_shards: 36400,
+                values: 5821925,
             },
         }
     "#]];

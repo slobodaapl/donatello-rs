@@ -18,6 +18,8 @@ enum Commands {
     Search(SearchCli),
     /// Solve a crafting rotation
     Solve(commands::solve::SolveArgs),
+    /// Solve from an arbitrary live state using a machine-readable JSON request
+    SolveLive(commands::solve_live::SolveLiveArgs),
     /// Show ingredients for a recipe
     Ingredients(commands::ingredients::IngredientsArgs),
 }
@@ -57,6 +59,7 @@ fn main() {
             None => commands::search_recipe::execute(&search_cli.recipe_search_args),
         },
         Commands::Solve(args) => commands::solve::execute(args),
+        Commands::SolveLive(args) => commands::solve_live::execute(args),
         Commands::Ingredients(args) => commands::ingredients::execute(args),
     }
 }

@@ -19,21 +19,23 @@ pub enum ActionCombo {
 
 impl ActionCombo {
     pub const fn into_bits(self) -> u8 {
+        const LEGACY_ACTION_COUNT: u8 = Action::COUNT as u8 - 1;
         match self {
+            Self::Single(Action::FinalAppraisal) => LEGACY_ACTION_COUNT + 8,
             Self::Single(action) => action.into_bits(),
-            Self::TricksOfTheTrade => Action::COUNT as u8,
-            Self::IntensiveSynthesis => Action::COUNT as u8 + 1,
-            Self::PreciseTouch => Action::COUNT as u8 + 2,
-            Self::StandardTouch => Action::COUNT as u8 + 3,
-            Self::AdvancedTouch => Action::COUNT as u8 + 4,
-            Self::FocusedTouch => Action::COUNT as u8 + 5,
-            Self::RefinedTouch => Action::COUNT as u8 + 6,
-            Self::None => Action::COUNT as u8 + 7,
+            Self::TricksOfTheTrade => LEGACY_ACTION_COUNT,
+            Self::IntensiveSynthesis => LEGACY_ACTION_COUNT + 1,
+            Self::PreciseTouch => LEGACY_ACTION_COUNT + 2,
+            Self::StandardTouch => LEGACY_ACTION_COUNT + 3,
+            Self::AdvancedTouch => LEGACY_ACTION_COUNT + 4,
+            Self::FocusedTouch => LEGACY_ACTION_COUNT + 5,
+            Self::RefinedTouch => LEGACY_ACTION_COUNT + 6,
+            Self::None => LEGACY_ACTION_COUNT + 7,
         }
     }
 
     pub const fn from_bits(bits: u8) -> Self {
-        const N: u8 = Action::COUNT as u8;
+        const N: u8 = Action::COUNT as u8 - 1;
         if bits < N {
             Self::Single(Action::from_bits(bits))
         } else if bits == N {
@@ -50,6 +52,8 @@ impl ActionCombo {
             Self::FocusedTouch
         } else if bits == N + 6 {
             Self::RefinedTouch
+        } else if bits == N + 8 {
+            Self::Single(Action::FinalAppraisal)
         } else {
             Self::None
         }
@@ -105,6 +109,7 @@ impl ActionCombo {
                 Action::RapidSynthesis => &[Action::RapidSynthesis],
                 Action::HastyTouch => &[Action::HastyTouch],
                 Action::DaringTouch => &[Action::DaringTouch],
+                Action::FinalAppraisal => &[Action::FinalAppraisal],
             },
         }
     }
@@ -118,7 +123,7 @@ impl ActionCombo {
     }
 }
 
-pub const FULL_SEARCH_ACTIONS: [ActionCombo; 36] = [
+pub const FULL_SEARCH_ACTIONS: [ActionCombo; 37] = [
     ActionCombo::AdvancedTouch,
     ActionCombo::TricksOfTheTrade,
     ActionCombo::IntensiveSynthesis,
@@ -159,6 +164,7 @@ pub const FULL_SEARCH_ACTIONS: [ActionCombo; 36] = [
     // misc
     ActionCombo::Single(Action::DelicateSynthesis),
     ActionCombo::Single(Action::StellarSteadyHand),
+    ActionCombo::Single(Action::FinalAppraisal),
 ];
 
 pub const PROGRESS_ONLY_SEARCH_ACTIONS: [ActionCombo; 16] = [
@@ -201,4 +207,122 @@ pub fn use_action_combo(
         state.effects.set_expedience(false);
     }
     Ok(state)
+}
+
+/// Execute actions using an already-observed deterministic condition prefix. Unlike the Normal
+/// solver convenience, this preserves the real combo state after an individual prefix action.
+pub fn use_action_combo_with_condition(
+    settings: &SolverSettings,
+    mut state: SimulationState,
+    action_combo: ActionCombo,
+    mut condition: Condition,
+) -> Result<(SimulationState, Condition), ActionError> {
+    for action in action_combo.actions() {
+        state = state.use_action(*action, condition, &settings.simulator_settings)?;
+        if action.increases_step_count() {
+            condition = condition.deterministic_successor();
+        }
+    }
+    Ok((state, condition))
+}
+
+#[cfg(test)]
+mod condition_prefix_tests {
+    use super::*;
+
+    const SETTINGS: Settings = Settings {
+        max_cp: 500,
+        max_durability: 80,
+        max_progress: 5000,
+        max_quality: 50000,
+        base_progress: 100,
+        base_quality: 100,
+        job_level: 100,
+        allowed_actions: ActionMask::all(),
+        adversarial: false,
+        backload_progress: false,
+        stellar_steady_hand_charges: 0,
+    };
+
+    fn solver_settings() -> SolverSettings {
+        SolverSettings {
+            simulator_settings: SETTINGS,
+            allow_non_max_quality_solutions: true,
+        }
+    }
+
+    #[test]
+    fn zero_step_preserves_excellent_then_actions_advance_to_poor_and_normal() {
+        let settings = solver_settings();
+        let root = SimulationState {
+            effects: Effects::initial(&SETTINGS).with_heart_and_soul_available(true),
+            ..SimulationState::new(&SETTINGS)
+        };
+        let (state, condition) = use_action_combo_with_condition(
+            &settings,
+            root,
+            ActionCombo::Single(Action::HeartAndSoul),
+            Condition::Excellent,
+        )
+        .unwrap();
+        assert_eq!(condition, Condition::Excellent);
+        let (state, condition) = use_action_combo_with_condition(
+            &settings,
+            state,
+            ActionCombo::Single(Action::BasicTouch),
+            condition,
+        )
+        .unwrap();
+        assert_eq!(condition, Condition::Poor);
+        assert_eq!(state.effects.combo(), Combo::BasicTouch);
+        let cp = state.cp;
+        let (state, condition) = use_action_combo_with_condition(
+            &settings,
+            state,
+            ActionCombo::Single(Action::StandardTouch),
+            condition,
+        )
+        .unwrap();
+        assert_eq!(condition, Condition::Normal);
+        assert_eq!(
+            cp - state.cp,
+            18,
+            "live combo discount must survive prefix replay"
+        );
+    }
+
+    #[test]
+    fn good_omen_advances_to_good_then_normal() {
+        let settings = solver_settings();
+        let root = SimulationState::new(&SETTINGS);
+        let (state, condition) = use_action_combo_with_condition(
+            &settings,
+            root,
+            ActionCombo::Single(Action::BasicSynthesis),
+            Condition::GoodOmen,
+        )
+        .unwrap();
+        assert_eq!(condition, Condition::Good);
+        let (_, condition) = use_action_combo_with_condition(
+            &settings,
+            state,
+            ActionCombo::Single(Action::BasicSynthesis),
+            condition,
+        )
+        .unwrap();
+        assert_eq!(condition, Condition::Normal);
+    }
+
+    #[test]
+    fn final_appraisal_combo_encoding_round_trips_without_shifting_legacy_codes() {
+        let final_appraisal = ActionCombo::Single(Action::FinalAppraisal);
+        assert_eq!(
+            ActionCombo::from_bits(final_appraisal.into_bits()),
+            final_appraisal
+        );
+        assert_eq!(
+            ActionCombo::TricksOfTheTrade.into_bits(),
+            Action::COUNT as u8 - 1
+        );
+    }
 }

@@ -11,6 +11,7 @@ harness = false
 raphael-sim = { workspace = true }
 raphael-solver = { workspace = true }
 raphael-data = { workspace = true }
+donatello-ffi = { path = "../donatello-ffi" }
 rayon = { workspace = true }
 log = { workspace = true }
 
