@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+use raphael_data::{CrafterStats, RECIPES, RLVLS, get_game_settings};
 use raphael_sim::{Action, ActionMask, Condition, Settings, SimulationState};
 use raphael_solver::{AtomicFlag, MacroSolver, SolverSettings};
 use serde::Serialize;
@@ -77,7 +78,9 @@ struct ConditionSummary {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FixtureSummary {
-    name: &'static str,
+    name: String,
+    job_level: Option<u8>,
+    expert: Option<bool>,
     baseline_actions: usize,
     baseline_score: PlanScore,
     elapsed_millis: u128,
@@ -247,12 +250,20 @@ fn merge(target: &mut ConditionSummary, source: &ConditionSummary) {
     target.solve_micros += source.solve_micros;
 }
 
-fn run_fixture(fixture: Fixture, mode: Mode) -> FixtureSummary {
+fn run_case(
+    name: String,
+    job_level: Option<u8>,
+    expert: Option<bool>,
+    baseline_settings: Settings,
+    adaptive_settings: Settings,
+) -> Option<FixtureSummary> {
     let started = Instant::now();
-    let baseline_settings = settings(fixture, mode, false);
-    let adaptive_settings = settings(fixture, mode, true);
+    eprintln!("running fixture: {name}");
     let mut raphael = solver(baseline_settings);
-    let baseline = raphael.solve().expect("baseline Raphael solve failed");
+    let Ok(baseline) = raphael.solve() else {
+        eprintln!("skipping unsolved baseline fixture: {name}");
+        return None;
+    };
     let baseline_score = evaluate(
         &baseline_settings,
         SimulationState::new(&baseline_settings),
@@ -278,7 +289,7 @@ fn run_fixture(fixture: Fixture, mode: Mode) -> FixtureSummary {
                 .map_err(|error| {
                     eprintln!(
                         "solve failure: fixture={}, condition={condition:?}, boundary={index}, root={root:?}, incumbent={incumbent:?}, incumbent_actions={:?}, error={error:?}",
-                        fixture.name,
+                        name,
                         &baseline[index..],
                     );
                 });
@@ -288,13 +299,105 @@ fn run_fixture(fixture: Fixture, mode: Mode) -> FixtureSummary {
         conditions.insert(format!("{condition:?}"), summary);
     }
 
-    FixtureSummary {
-        name: fixture.name,
+    Some(FixtureSummary {
+        name,
+        job_level,
+        expert,
         baseline_actions: baseline.len(),
         baseline_score,
         elapsed_millis: started.elapsed().as_millis(),
         conditions,
+    })
+}
+
+fn run_fixture(fixture: Fixture, mode: Mode) -> FixtureSummary {
+    run_case(
+        fixture.name.to_owned(),
+        None,
+        None,
+        settings(fixture, mode, false),
+        settings(fixture, mode, true),
+    )
+    .expect("synthetic baseline Raphael solve failed")
+}
+
+fn real_fixtures(mode: Mode) -> Vec<(String, u8, bool, Settings, Settings)> {
+    const CRAFTER_CURVE: [(u8, u16, u16, u16); 10] = [
+        (10, 50, 45, 200),
+        (20, 110, 100, 230),
+        (30, 180, 165, 260),
+        (40, 250, 230, 295),
+        (50, 350, 325, 340),
+        (60, 950, 850, 400),
+        (70, 1550, 1450, 470),
+        (80, 2450, 2250, 515),
+        (90, 3350, 3150, 550),
+        (100, 5200, 4800, 630),
+    ];
+    let mut result = Vec::new();
+    for (job_level, craftsmanship, control, cp) in CRAFTER_CURVE {
+        let crafter = CrafterStats {
+            craftsmanship,
+            control,
+            cp,
+            level: job_level,
+            manipulation: job_level >= 65,
+            heart_and_soul: false,
+            quick_innovation: false,
+        };
+        for expert in [false, true] {
+            let mut candidates = RECIPES
+                .values()
+                .filter(|recipe| {
+                    recipe.max_level_scaling == 0
+                        && recipe.is_expert == expert
+                        && RLVLS[recipe.recipe_level as usize].job_level == job_level
+                        && recipe.req_craftsmanship <= crafter.craftsmanship
+                        && recipe.req_control <= crafter.control
+                })
+                .map(|recipe| {
+                    let mut settings = get_game_settings(*recipe, None, crafter, None, None);
+                    settings.allowed_actions = action_mask(mode, false);
+                    (*recipe, settings)
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_by_key(|(_, settings)| {
+                std::cmp::Reverse((settings.max_progress as u32) * (settings.max_quality as u32))
+            });
+            let mut seen = Vec::new();
+            for (recipe, baseline) in candidates {
+                let signature = (
+                    baseline.max_progress,
+                    baseline.max_quality,
+                    baseline.max_durability,
+                    baseline.base_progress,
+                    baseline.base_quality,
+                );
+                if seen.contains(&signature) {
+                    continue;
+                }
+                seen.push(signature);
+                let mut adaptive = baseline;
+                adaptive.allowed_actions = action_mask(mode, true);
+                result.push((
+                    format!(
+                        "L{job_level}-{}-item{}-rlvl{}",
+                        if expert { "expert" } else { "regular" },
+                        recipe.item_id,
+                        recipe.recipe_level,
+                    ),
+                    job_level,
+                    expert,
+                    baseline,
+                    adaptive,
+                ));
+                if seen.len() == 10 {
+                    break;
+                }
+            }
+        }
     }
+    result
 }
 
 fn fixtures(mode: Mode) -> &'static [Fixture] {
@@ -337,13 +440,17 @@ fn fixtures(mode: Mode) -> &'static [Fixture] {
 fn main() {
     let mut mode = Mode::Quick;
     let mut json = false;
+    let mut real = false;
+    let mut summary_only = false;
     for argument in std::env::args().skip(1) {
         match argument.as_str() {
             "--quick" => mode = Mode::Quick,
             "--full" => mode = Mode::Full,
             "--json" => json = true,
+            "--real" => real = true,
+            "--summary" => summary_only = true,
             "--help" | "-h" => {
-                println!("Usage: donatello-bench [--quick|--full] [--json]");
+                println!("Usage: donatello-bench [--quick|--full] [--real] [--summary] [--json]");
                 return;
             }
             _ => panic!("unknown argument {argument}"),
@@ -351,15 +458,26 @@ fn main() {
     }
 
     let mut report = Report {
-        mode: match mode {
-            Mode::Quick => "quick",
-            Mode::Full => "full",
+        mode: match (mode, real) {
+            (Mode::Quick, false) => "quick",
+            (Mode::Full, false) => "full",
+            (Mode::Quick, true) => "real-quick",
+            (Mode::Full, true) => "real-full",
         },
-        fixtures: fixtures(mode)
-            .iter()
-            .copied()
-            .map(|fixture| run_fixture(fixture, mode))
-            .collect(),
+        fixtures: if real {
+            real_fixtures(mode)
+                .into_iter()
+                .filter_map(|(name, level, expert, baseline, adaptive)| {
+                    run_case(name, Some(level), Some(expert), baseline, adaptive)
+                })
+                .collect()
+        } else {
+            fixtures(mode)
+                .iter()
+                .copied()
+                .map(|fixture| run_fixture(fixture, mode))
+                .collect()
+        },
         totals: ConditionSummary::default(),
     };
     for fixture in &report.fixtures {
@@ -382,10 +500,40 @@ fn main() {
             report.totals.solve_failures,
             report.totals.completion_regressions,
         );
+        if real {
+            let mut cohorts: BTreeMap<(u8, bool), ConditionSummary> = BTreeMap::new();
+            for fixture in &report.fixtures {
+                let key = (fixture.job_level.unwrap(), fixture.expert.unwrap());
+                let cohort = cohorts.entry(key).or_default();
+                for summary in fixture.conditions.values() {
+                    merge(cohort, summary);
+                }
+            }
+            println!("\nStrict-win rate by real-recipe cohort:");
+            for ((level, expert), cohort) in cohorts {
+                let rate = 100.0 * cohort.strict_wins as f64 / cohort.scenarios as f64;
+                let bar = "█".repeat((rate / 2.0).round() as usize);
+                println!(
+                    "  L{level:>3} {:>7}: {:>6.2}% ({}/{}) {bar}",
+                    if expert { "expert" } else { "regular" },
+                    rate,
+                    cohort.strict_wins,
+                    cohort.scenarios,
+                );
+            }
+        }
+        if summary_only {
+            return;
+        }
         for fixture in &report.fixtures {
             println!(
-                "  {}: baseline {} actions, quality {}, {} ms",
+                "  {}{}: baseline {} actions, quality {}, {} ms",
                 fixture.name,
+                match (fixture.job_level, fixture.expert) {
+                    (Some(level), Some(expert)) =>
+                        format!(" [L{level} {}]", if expert { "expert" } else { "regular" }),
+                    _ => String::new(),
+                },
                 fixture.baseline_actions,
                 fixture.baseline_score.quality,
                 fixture.elapsed_millis,
