@@ -310,6 +310,13 @@ mod tests {
     }
 
     #[test]
+    fn initial_root_returns_a_solution_without_the_cli() {
+        let response = solve_json(&request(0));
+        assert!(response.contains(r#""ok":true"#), "{response}");
+        assert!(response.contains(r#""actionIds":["#), "{response}");
+    }
+
+    #[test]
     fn abi_version_is_stable() {
         assert_eq!(donatello_abi_version(), 2);
     }

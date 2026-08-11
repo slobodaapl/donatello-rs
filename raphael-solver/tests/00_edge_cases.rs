@@ -258,9 +258,9 @@ fn large_progress_quality_increase() {
                 values: 8280020,
             },
             step_lb_stats: StepLbSolverStats {
-                states_on_main: 320,
-                states_on_shards: 5236,
-                values: 22793,
+                states_on_main: 419,
+                states_on_shards: 8322,
+                values: 34247,
             },
         }
     "#]];
@@ -422,9 +422,9 @@ fn issue_312_quick_innovation_reflect() {
                 values: 33548,
             },
             step_lb_stats: StepLbSolverStats {
-                states_on_main: 46,
-                states_on_shards: 75,
-                values: 194,
+                states_on_main: 60,
+                states_on_shards: 170,
+                values: 368,
             },
         }
     "#]];
@@ -477,7 +477,7 @@ fn daring_touch_interrupted_combo() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 27,
+                inserted_nodes: 28,
                 processed_nodes: 10,
             },
             finish_solver_stats: FinishSolverStats {
@@ -490,9 +490,9 @@ fn daring_touch_interrupted_combo() {
                 values: 26324,
             },
             step_lb_stats: StepLbSolverStats {
-                states_on_main: 403,
-                states_on_shards: 1433,
-                values: 4718,
+                states_on_main: 528,
+                states_on_shards: 2680,
+                values: 8173,
             },
         }
     "#]];
