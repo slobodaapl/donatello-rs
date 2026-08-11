@@ -354,7 +354,13 @@ pub fn execute(args: &SolveArgs) {
         Box::new(|_| {}),
         AtomicFlag::new(),
     );
-    let actions = solver.solve().expect("Failed to solve");
+    let actions = match solver.solve() {
+        Ok(actions) => actions,
+        Err(error) => {
+            eprintln!("NO_SOLUTION: {error:?}");
+            std::process::exit(2);
+        }
+    };
 
     let final_state = SimulationState::from_macro(&settings, &actions).unwrap();
     let state_quality = final_state.quality;
