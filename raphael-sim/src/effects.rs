@@ -49,7 +49,10 @@ pub struct Effects {
     /// Remaining Crafter's Delineations shared by specialist actions.
     pub crafter_delineations: u8,
 
-    #[bits(12)]
+    /// Cosmic/Splendorous tools increase Good-condition quality to 175%.
+    pub splendor_cosmic: bool,
+
+    #[bits(11)]
     pub _padding: u32,
 }
 

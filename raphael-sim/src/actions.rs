@@ -38,19 +38,21 @@ pub trait ActionImpl {
         let action_mod = Self::quality_modifier(state, settings);
         let effect_mod = state.effects.quality_modifier();
         let condition_mod = match condition {
-            Condition::Normal => 2,
-            Condition::Good => 3,
-            Condition::Excellent => 8,
-            Condition::Poor => 1,
+            Condition::Normal => 4,
+            Condition::Good if state.effects.splendor_cosmic() => 7,
+            Condition::Good => 6,
+            Condition::Excellent => 16,
+            Condition::Poor => 2,
             Condition::Centered
             | Condition::Sturdy
             | Condition::Pliant
             | Condition::Malleable
             | Condition::Primed
-            | Condition::GoodOmen => 2,
+            | Condition::GoodOmen
+            | Condition::Robust => 4,
         };
         let quality =
-            u32::from(settings.base_quality) * action_mod * effect_mod * condition_mod / 20000;
+            u32::from(settings.base_quality) * action_mod * effect_mod * condition_mod / 40000;
         quality.try_into().unwrap_or(u16::MAX)
     }
 
@@ -63,7 +65,7 @@ pub trait ActionImpl {
             _ => Self::base_durability_cost(state, settings).div_ceil(2),
         };
         match condition {
-            Condition::Sturdy => cost.div_ceil(2),
+            Condition::Sturdy | Condition::Robust => cost.div_ceil(2),
             _ => cost,
         }
     }

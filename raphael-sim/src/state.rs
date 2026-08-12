@@ -163,6 +163,10 @@ impl SimulationState {
                 state.durability = std::cmp::min(settings.max_durability, state.durability + 5);
             }
             state.effects = state.effects.tick_down();
+        } else if state.effects.stellar_steady_hand() != 0 {
+            state.effects.set_stellar_steady_hand(
+                state.effects.stellar_steady_hand().saturating_sub(1),
+            );
         }
 
         A::transform(&mut state, settings, condition);
@@ -283,5 +287,65 @@ impl SimulationState {
             Action::DaringTouch => self.use_action_impl::<DaringTouch>(settings, condition),
             Action::FinalAppraisal => self.use_action_impl::<FinalAppraisal>(settings, condition),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ActionMask;
+
+    #[test]
+    fn stellar_steady_hand_counts_zero_step_actions() {
+        let settings = Settings {
+            max_cp: 500,
+            max_durability: 40,
+            max_progress: 100,
+            max_quality: 1000,
+            base_progress: 10,
+            base_quality: 10,
+            job_level: 100,
+            allowed_actions: ActionMask::all(),
+            adversarial: false,
+            backload_progress: false,
+            stellar_steady_hand_charges: 1,
+        };
+        let state = SimulationState::new(&settings)
+            .use_action(Action::StellarSteadyHand, Condition::Normal, &settings)
+            .unwrap();
+        assert_eq!(state.effects.stellar_steady_hand(), 3);
+
+        let state = state
+            .use_action(Action::FinalAppraisal, Condition::Normal, &settings)
+            .unwrap();
+        assert_eq!(state.effects.stellar_steady_hand(), 2);
+    }
+
+    #[test]
+    fn splendor_cosmic_tool_uses_175_percent_good_quality() {
+        let settings = Settings {
+            max_cp: 500,
+            max_durability: 40,
+            max_progress: 100,
+            max_quality: 1000,
+            base_progress: 10,
+            base_quality: 10,
+            job_level: 100,
+            allowed_actions: ActionMask::all(),
+            adversarial: false,
+            backload_progress: false,
+            stellar_steady_hand_charges: 0,
+        };
+        let normal_tool = SimulationState::new(&settings)
+            .use_action(Action::BasicTouch, Condition::Good, &settings)
+            .unwrap();
+        let mut cosmic_tool = SimulationState::new(&settings);
+        cosmic_tool.effects.set_splendor_cosmic(true);
+        let cosmic_tool = cosmic_tool
+            .use_action(Action::BasicTouch, Condition::Good, &settings)
+            .unwrap();
+
+        assert_eq!(normal_tool.quality, 15);
+        assert_eq!(cosmic_tool.quality, 17);
     }
 }

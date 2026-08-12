@@ -12,7 +12,7 @@ use raphael_sim::{
 use raphael_solver::{AtomicFlag, MacroSolver, SolverSettings};
 use serde::{Deserialize, Serialize};
 
-const ABI_VERSION: u32 = 3;
+const ABI_VERSION: u32 = 5;
 const DEFAULT_CACHE_BUDGET: usize = 512 * 1024 * 1024;
 
 type CachedSolver = Arc<Mutex<MacroSolver<'static>>>;
@@ -35,7 +35,7 @@ struct SolverCache {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SolveRequest {
+struct CraftSolveRequest {
     abi_version: u32,
     max_cp: u16,
     max_durability: u16,
@@ -48,7 +48,11 @@ struct SolveRequest {
     specialist: bool,
     backload_progress: bool,
     #[serde(default)]
+    objective: u8,
+    #[serde(default)]
     minimize_steps: bool,
+    #[serde(default)]
+    stellar_steady_hand_charges: u8,
     #[serde(default)]
     incumbent_action_ids: Vec<u32>,
     root: RootState,
@@ -76,6 +80,12 @@ struct RootState {
     quick_innovation_available: bool,
     trained_perfection_active: bool,
     trained_perfection_available: bool,
+    #[serde(default)]
+    stellar_steady_hand_charges: u8,
+    #[serde(default)]
+    stellar_steady_hand: u8,
+    #[serde(default)]
+    splendor_cosmic: bool,
     expedience: bool,
     condition: u8,
     crafter_delineations: u8,
@@ -103,6 +113,7 @@ fn condition(value: u8) -> Result<Condition, String> {
         7 => Ok(Condition::Malleable),
         8 => Ok(Condition::Primed),
         9 => Ok(Condition::GoodOmen),
+        10 => Ok(Condition::Robust),
         _ => Err(format!("unsupported condition {value}")),
     }
 }
@@ -136,6 +147,9 @@ fn build_state(root: &RootState, backload_progress: bool) -> Result<SimulationSt
         .with_quick_innovation_available(root.quick_innovation_available)
         .with_trained_perfection_active(root.trained_perfection_active)
         .with_trained_perfection_available(root.trained_perfection_available)
+        .with_stellar_steady_hand_charges(root.stellar_steady_hand_charges)
+        .with_stellar_steady_hand(root.stellar_steady_hand.min(3))
+        .with_splendor_cosmic(root.splendor_cosmic)
         .with_expedience(root.expedience);
     let effects = effects.with_crafter_delineations(root.crafter_delineations.min(2));
     Ok(SimulationState {
@@ -148,18 +162,37 @@ fn build_state(root: &RootState, backload_progress: bool) -> Result<SimulationSt
     })
 }
 
-fn solve(request: SolveRequest, interrupt: AtomicFlag) -> Result<Vec<u32>, String> {
+fn solve(request: CraftSolveRequest, interrupt: AtomicFlag) -> Result<Vec<u32>, String> {
     if request.abi_version != ABI_VERSION {
         return Err(format!("unsupported ABI version {}", request.abi_version));
     }
     if interrupt.is_set() {
         return Err(String::from("Interrupted"));
     }
-    let mut allowed_actions = ActionMask::regular()
-        .add(Action::FinalAppraisal)
-        .remove(Action::RapidSynthesis)
-        .remove(Action::HastyTouch)
-        .remove(Action::DaringTouch);
+    if request.objective > 1 {
+        return Err(format!("unsupported objective {}", request.objective));
+    }
+    let mut allowed_actions = if request.objective == 1 {
+        progress_only_actions()
+    } else {
+        ActionMask::regular().add(Action::FinalAppraisal)
+    };
+    if request.stellar_steady_hand_charges > 0 {
+        allowed_actions = allowed_actions
+            .add(Action::StellarSteadyHand)
+            .add(Action::RapidSynthesis);
+        if request.objective == 0 {
+            allowed_actions = allowed_actions
+                .add(Action::HastyTouch)
+                .add(Action::DaringTouch);
+        }
+    } else {
+        allowed_actions = allowed_actions
+            .remove(Action::StellarSteadyHand)
+            .remove(Action::RapidSynthesis)
+            .remove(Action::HastyTouch)
+            .remove(Action::DaringTouch);
+    }
     if !request.manipulation {
         allowed_actions = allowed_actions.remove(Action::Manipulation);
     }
@@ -179,7 +212,7 @@ fn solve(request: SolveRequest, interrupt: AtomicFlag) -> Result<Vec<u32>, Strin
         allowed_actions,
         adversarial: false,
         backload_progress: request.backload_progress,
-        stellar_steady_hand_charges: 0,
+        stellar_steady_hand_charges: request.stellar_steady_hand_charges.min(3),
     };
     let state = build_state(&request.root, request.backload_progress)?;
     let current_condition = condition(request.root.condition)?;
@@ -226,6 +259,24 @@ fn solve(request: SolveRequest, interrupt: AtomicFlag) -> Result<Vec<u32>, Strin
     let actions = result?;
     cache_solution(cache_key, &actions);
     Ok(actions.into_iter().map(Action::action_id).collect())
+}
+
+fn progress_only_actions() -> ActionMask {
+    ActionMask::none()
+        .add(Action::BasicSynthesis)
+        .add(Action::MasterMend)
+        .add(Action::WasteNot)
+        .add(Action::Veneration)
+        .add(Action::WasteNot2)
+        .add(Action::MuscleMemory)
+        .add(Action::CarefulSynthesis)
+        .add(Action::Manipulation)
+        .add(Action::Groundwork)
+        .add(Action::IntensiveSynthesis)
+        .add(Action::PrudentSynthesis)
+        .add(Action::ImmaculateMend)
+        .add(Action::TrainedPerfection)
+        .add(Action::FinalAppraisal)
 }
 
 fn cached_solution(key: &SolutionCacheKey) -> Option<Vec<Action>> {
@@ -411,6 +462,34 @@ pub fn solve_json(data: &[u8]) -> String {
     solve_json_with_flag(data, AtomicFlag::new())
 }
 
+fn gathering_response_json(data: &[u8]) -> CString {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let request: gathering_solvers::SolveRequest =
+            serde_json::from_slice(data).map_err(|error| error.to_string())?;
+        gathering_solvers::solve(&request)
+    }))
+    .unwrap_or_else(|_| Err(String::from("native gathering solver panic")));
+    let json = match result {
+        Ok(decision) => serde_json::json!({ "ok": true, "decision": decision }),
+        Err(error) => serde_json::json!({ "ok": false, "error": error }),
+    };
+    CString::new(json.to_string()).unwrap()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn donatello_gathering_solve_json(
+    data: *const u8,
+    len: usize,
+) -> *mut c_char {
+    if data.is_null() {
+        return CString::new(r#"{"ok":false,"error":"null request pointer"}"#)
+            .unwrap()
+            .into_raw();
+    }
+    let bytes = unsafe { slice::from_raw_parts(data, len) };
+    gathering_response_json(bytes).into_raw()
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn donatello_solve_json(data: *const u8, len: usize) -> *mut c_char {
     if data.is_null() {
@@ -494,16 +573,21 @@ mod tests {
 
     fn request(condition: u8) -> Vec<u8> {
         format!(
-            r#"{{"abiVersion":3,"maxCp":500,"maxDurability":40,"maxProgress":500,"maxQuality":500,"baseProgress":100,"baseQuality":100,"jobLevel":100,"manipulation":true,"specialist":false,"backloadProgress":false,"minimizeSteps":false,"root":{{"cp":500,"durability":40,"progress":0,"quality":0,"innerQuiet":0,"wasteNot":0,"manipulation":0,"innovation":0,"veneration":0,"greatStrides":0,"muscleMemory":0,"finalAppraisal":0,"carefulObservationCharges":0,"combo":3,"heartAndSoulActive":false,"heartAndSoulAvailable":false,"quickInnovationAvailable":false,"trainedPerfectionActive":false,"trainedPerfectionAvailable":true,"expedience":false,"condition":{condition},"crafterDelineations":0}}}}"#
+            r#"{{"abiVersion":5,"maxCp":500,"maxDurability":40,"maxProgress":500,"maxQuality":500,"baseProgress":100,"baseQuality":100,"jobLevel":100,"manipulation":true,"specialist":false,"backloadProgress":false,"objective":0,"minimizeSteps":false,"stellarSteadyHandCharges":0,"root":{{"cp":500,"durability":40,"progress":0,"quality":0,"innerQuiet":0,"wasteNot":0,"manipulation":0,"innovation":0,"veneration":0,"greatStrides":0,"muscleMemory":0,"finalAppraisal":0,"carefulObservationCharges":0,"combo":3,"heartAndSoulActive":false,"heartAndSoulAvailable":false,"quickInnovationAvailable":false,"trainedPerfectionActive":false,"trainedPerfectionAvailable":true,"stellarSteadyHandCharges":0,"stellarSteadyHand":0,"expedience":false,"condition":{condition},"crafterDelineations":0}}}}"#
         )
         .into_bytes()
     }
 
     #[test]
     fn rejects_unknown_condition_without_normalizing_it() {
-        let response = solve_json(&request(10));
+        let response = solve_json(&request(11));
         assert!(response.contains(r#""ok":false"#));
-        assert!(response.contains("unsupported condition 10"));
+        assert!(response.contains("unsupported condition 11"));
+    }
+
+    #[test]
+    fn accepts_robust_condition() {
+        assert_eq!(condition(10).unwrap(), Condition::Robust);
     }
 
     #[test]
@@ -523,13 +607,30 @@ mod tests {
     }
 
     #[test]
+    fn progress_only_request_returns_only_progress_mask_actions() {
+        let mut request: serde_json::Value = serde_json::from_slice(&request(0)).unwrap();
+        request["objective"] = 1.into();
+        request["maxQuality"] = 0.into();
+
+        let response = solve_json(&serde_json::to_vec(&request).unwrap());
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["ok"], true, "{response}");
+        let actions = response["actionIds"].as_array().unwrap();
+        assert!(!actions.is_empty());
+        for action_id in actions {
+            let action = Action::from_action_id(action_id.as_u64().unwrap() as u32).unwrap();
+            assert!(progress_only_actions().has(action), "unexpected {action:?}");
+        }
+    }
+
+    #[test]
     fn abi_version_is_stable() {
-        assert_eq!(donatello_abi_version(), 3);
+        assert_eq!(donatello_abi_version(), 5);
     }
 
     #[test]
     fn camel_case_v2_request_preserves_shared_specialist_resource() {
-        let mut request: SolveRequest = serde_json::from_slice(&request(0)).unwrap();
+        let mut request: CraftSolveRequest = serde_json::from_slice(&request(0)).unwrap();
         request.root.crafter_delineations = 1;
         request.root.heart_and_soul_available = true;
         request.root.quick_innovation_available = true;
@@ -539,7 +640,7 @@ mod tests {
 
     #[test]
     fn progressed_backload_root_forbids_further_quality_actions() {
-        let mut request: SolveRequest = serde_json::from_slice(&request(0)).unwrap();
+        let mut request: CraftSolveRequest = serde_json::from_slice(&request(0)).unwrap();
         request.root.progress = 1;
         let state = build_state(&request.root, true).unwrap();
         assert!(!state.effects.quality_actions_allowed());
@@ -547,7 +648,7 @@ mod tests {
 
     #[test]
     fn arbitrary_root_preserves_every_represented_resource_and_effect() {
-        let mut request: SolveRequest = serde_json::from_slice(&request(0)).unwrap();
+        let mut request: CraftSolveRequest = serde_json::from_slice(&request(0)).unwrap();
         request.root.cp = 237;
         request.root.durability = 17;
         request.root.progress = 123;
@@ -568,6 +669,9 @@ mod tests {
         request.root.trained_perfection_active = true;
         request.root.trained_perfection_available = false;
         request.root.expedience = true;
+        request.root.stellar_steady_hand_charges = 2;
+        request.root.stellar_steady_hand = 3;
+        request.root.splendor_cosmic = true;
 
         let state = build_state(&request.root, false).unwrap();
         assert_eq!(state.cp, 237);
@@ -590,6 +694,25 @@ mod tests {
         assert!(state.effects.trained_perfection_active());
         assert!(!state.effects.trained_perfection_available());
         assert!(state.effects.expedience());
+        assert_eq!(state.effects.stellar_steady_hand_charges(), 2);
+        assert_eq!(state.effects.stellar_steady_hand(), 3);
+        assert!(state.effects.splendor_cosmic());
+    }
+
+    #[test]
+    fn progress_only_action_set_excludes_every_quality_action() {
+        let actions = progress_only_actions();
+        for action in [
+            Action::BasicTouch,
+            Action::HastyTouch,
+            Action::DelicateSynthesis,
+            Action::ByregotsBlessing,
+            Action::TrainedEye,
+        ] {
+            assert!(!actions.has(action), "{action:?} must be excluded");
+        }
+        assert!(actions.has(Action::BasicSynthesis));
+        assert!(actions.has(Action::Groundwork));
     }
 
     #[test]

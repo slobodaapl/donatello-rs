@@ -11,6 +11,7 @@ pub enum Condition {
     Malleable,
     Primed,
     GoodOmen,
+    Robust,
 }
 
 impl Condition {
@@ -19,6 +20,7 @@ impl Condition {
         match self {
             Self::Excellent => Self::Poor,
             Self::GoodOmen => Self::Good,
+            Self::Robust => Self::Sturdy,
             _ => Self::Normal,
         }
     }

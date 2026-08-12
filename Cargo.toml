@@ -8,6 +8,7 @@ members = [
     "raphael-translations",
     "donatello-ffi",
     "donatello-bench",
+    "gathering-solvers",
 ]
 resolver = "2"
 
@@ -28,6 +29,7 @@ raphael-sim = { path = "raphael-sim" }
 raphael-solver = { path = "raphael-solver" }
 raphael-data = { path = "raphael-data" }
 raphael-translations = { path = "raphael-translations" }
+gathering-solvers = { path = "gathering-solvers" }
 rayon = "1.11"
 serde = { version = "1.0", features = ["derive"] }
 toml_edit = "0.23"

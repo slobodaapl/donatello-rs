@@ -1096,6 +1096,7 @@ dependencies = [
 name = "donatello-ffi"
 version = "0.1.0"
 dependencies = [
+ "gathering-solvers",
  "raphael-sim",
  "raphael-solver",
  "serde",
@@ -1691,6 +1692,13 @@ dependencies = [
  "futures-task",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "gathering-solvers"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
