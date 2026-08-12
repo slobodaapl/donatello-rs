@@ -1,6 +1,9 @@
+use std::collections::VecDeque;
 use std::ffi::{CString, c_char};
+use std::mem::size_of;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::slice;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use raphael_sim::{
@@ -9,11 +12,26 @@ use raphael_sim::{
 use raphael_solver::{AtomicFlag, MacroSolver, SolverSettings};
 use serde::{Deserialize, Serialize};
 
-const ABI_VERSION: u32 = 2;
-const MAX_CACHED_SOLVERS: usize = 8;
+const ABI_VERSION: u32 = 3;
+const DEFAULT_CACHE_BUDGET: usize = 512 * 1024 * 1024;
 
 type CachedSolver = Arc<Mutex<MacroSolver<'static>>>;
-static SOLVER_CACHE: OnceLock<Mutex<Vec<(SolverSettings, CachedSolver)>>> = OnceLock::new();
+static SOLVER_CACHE: OnceLock<Mutex<SolverCache>> = OnceLock::new();
+type SolutionCacheKey = (SolverSettings, SimulationState, Condition, bool);
+static SOLUTION_CACHE: OnceLock<Mutex<SolutionCache>> = OnceLock::new();
+static CACHE_BUDGET: AtomicUsize = AtomicUsize::new(DEFAULT_CACHE_BUDGET);
+
+#[derive(Default)]
+struct SolutionCache {
+    entries: VecDeque<(SolutionCacheKey, Vec<Action>)>,
+    retained_bytes: usize,
+}
+
+#[derive(Default)]
+struct SolverCache {
+    entries: VecDeque<(SolverSettings, CachedSolver, usize)>,
+    retained_bytes: usize,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,6 +47,10 @@ struct SolveRequest {
     manipulation: bool,
     specialist: bool,
     backload_progress: bool,
+    #[serde(default)]
+    minimize_steps: bool,
+    #[serde(default)]
+    incumbent_action_ids: Vec<u32>,
     root: RootState,
 }
 
@@ -130,6 +152,9 @@ fn solve(request: SolveRequest, interrupt: AtomicFlag) -> Result<Vec<u32>, Strin
     if request.abi_version != ABI_VERSION {
         return Err(format!("unsupported ABI version {}", request.abi_version));
     }
+    if interrupt.is_set() {
+        return Err(String::from("Interrupted"));
+    }
     let mut allowed_actions = ActionMask::regular()
         .add(Action::FinalAppraisal)
         .remove(Action::RapidSynthesis)
@@ -158,28 +183,132 @@ fn solve(request: SolveRequest, interrupt: AtomicFlag) -> Result<Vec<u32>, Strin
     };
     let state = build_state(&request.root, request.backload_progress)?;
     let current_condition = condition(request.root.condition)?;
+    let incumbent = request
+        .incumbent_action_ids
+        .into_iter()
+        .map(|action_id| {
+            Action::from_action_id(action_id)
+                .ok_or_else(|| format!("unsupported incumbent action {action_id}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let solver_settings = SolverSettings {
         simulator_settings: settings,
         allow_non_max_quality_solutions: true,
     };
-    let solver = cached_solver(solver_settings);
-    let mut solver = solver
+    let cache_key = (
+        solver_settings,
+        state,
+        current_condition,
+        request.minimize_steps,
+    );
+    if let Some(actions) = cached_solution(&cache_key) {
+        return Ok(actions.into_iter().map(Action::action_id).collect());
+    }
+    let cached_solver = cached_solver(solver_settings);
+    let mut solver = cached_solver
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(actions) = cached_solution(&cache_key) {
+        return Ok(actions.into_iter().map(Action::action_id).collect());
+    }
     solver.set_interrupt_signal(interrupt);
-    let actions = solver
-        .solve_from_state_with_condition(state, current_condition)
-        .map_err(|error| format!("{error:?}"))?;
+    let result = solver
+        .solve_from_state_with_condition_and_incumbent_objective(
+            state,
+            current_condition,
+            &incumbent,
+            request.minimize_steps,
+        )
+        .map_err(|error| format!("{error:?}"));
+    let retained_bytes = solver.estimated_retained_bytes();
+    drop(solver);
+    update_solver_weight(&cached_solver, retained_bytes);
+    let actions = result?;
+    cache_solution(cache_key, &actions);
     Ok(actions.into_iter().map(Action::action_id).collect())
 }
 
+fn cached_solution(key: &SolutionCacheKey) -> Option<Vec<Action>> {
+    let mut cache = SOLUTION_CACHE
+        .get_or_init(|| Mutex::new(SolutionCache::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let index = cache
+        .entries
+        .iter()
+        .position(|(cached_key, _)| cached_key == key)?;
+    let entry = cache.entries.remove(index).unwrap();
+    let actions = entry.1.clone();
+    cache.entries.push_back(entry);
+    Some(actions)
+}
+
+fn cache_solution(key: SolutionCacheKey, actions: &[Action]) {
+    let mut cache = SOLUTION_CACHE
+        .get_or_init(|| Mutex::new(SolutionCache::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(index) = cache
+        .entries
+        .iter()
+        .position(|(cached_key, _)| *cached_key == key)
+    {
+        if let Some((_, old_actions)) = cache.entries.remove(index) {
+            cache.retained_bytes = cache
+                .retained_bytes
+                .saturating_sub(entry_size(&old_actions));
+        }
+    }
+    let actions = actions.to_vec();
+    let entry_bytes = entry_size(&actions);
+    let budget = CACHE_BUDGET.load(Ordering::Relaxed) / 16;
+    if entry_bytes > budget {
+        return;
+    }
+    while cache.retained_bytes.saturating_add(entry_bytes) > budget {
+        let Some((_, old_actions)) = cache.entries.pop_front() else {
+            break;
+        };
+        cache.retained_bytes = cache
+            .retained_bytes
+            .saturating_sub(entry_size(&old_actions));
+    }
+    cache.retained_bytes += entry_bytes;
+    cache.entries.push_back((key, actions));
+}
+
+fn entry_size(actions: &Vec<Action>) -> usize {
+    size_of::<SolutionCacheKey>() + size_of::<Action>() * actions.capacity()
+}
+
+fn trim_solution_cache() {
+    let mut cache = SOLUTION_CACHE
+        .get_or_init(|| Mutex::new(SolutionCache::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let budget = CACHE_BUDGET.load(Ordering::Relaxed) / 16;
+    while cache.retained_bytes > budget {
+        let Some((_, actions)) = cache.entries.pop_front() else {
+            break;
+        };
+        cache.retained_bytes = cache.retained_bytes.saturating_sub(entry_size(&actions));
+    }
+}
+
 fn cached_solver(settings: SolverSettings) -> CachedSolver {
-    let cache = SOLVER_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let cache = SOLVER_CACHE.get_or_init(|| Mutex::new(SolverCache::default()));
     let mut cache = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some((_, solver)) = cache.iter().find(|(key, _)| *key == settings) {
-        return Arc::clone(solver);
+    if let Some(index) = cache
+        .entries
+        .iter()
+        .position(|(key, _, _)| *key == settings)
+    {
+        let entry = cache.entries.remove(index).unwrap();
+        let solver = Arc::clone(&entry.1);
+        cache.entries.push_back(entry);
+        return solver;
     }
     let solver = Arc::new(Mutex::new(MacroSolver::new(
         settings,
@@ -187,11 +316,67 @@ fn cached_solver(settings: SolverSettings) -> CachedSolver {
         Box::new(|_| {}),
         AtomicFlag::new(),
     )));
-    if cache.len() == MAX_CACHED_SOLVERS {
-        cache.remove(0);
-    }
-    cache.push((settings, Arc::clone(&solver)));
+    let initial_bytes = size_of::<MacroSolver<'static>>();
+    cache.retained_bytes += initial_bytes;
+    cache
+        .entries
+        .push_back((settings, Arc::clone(&solver), initial_bytes));
     solver
+}
+
+fn update_solver_weight(solver: &CachedSolver, retained_bytes: usize) {
+    let mut cache = SOLVER_CACHE
+        .get_or_init(|| Mutex::new(SolverCache::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(index) = cache
+        .entries
+        .iter()
+        .position(|(_, candidate, _)| Arc::ptr_eq(candidate, solver))
+    else {
+        return;
+    };
+    let mut entry = cache.entries.remove(index).unwrap();
+    cache.retained_bytes = cache.retained_bytes.saturating_sub(entry.2);
+    entry.2 = retained_bytes;
+    let budget = CACHE_BUDGET.load(Ordering::Relaxed) * 15 / 16;
+    if retained_bytes > budget {
+        return;
+    }
+    cache.retained_bytes += retained_bytes;
+    cache.entries.push_back(entry);
+    while cache.retained_bytes > budget {
+        let Some((settings, candidate, bytes)) = cache.entries.pop_front() else {
+            break;
+        };
+        if Arc::strong_count(&candidate) > 1 {
+            cache.entries.push_back((settings, candidate, bytes));
+            break;
+        }
+        cache.retained_bytes = cache.retained_bytes.saturating_sub(bytes);
+    }
+}
+
+fn trim_solver_cache() {
+    let Some(cache) = SOLVER_CACHE.get() else {
+        return;
+    };
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let budget = CACHE_BUDGET.load(Ordering::Relaxed) * 15 / 16;
+    let mut checked = 0;
+    while cache.retained_bytes > budget && checked < cache.entries.len() {
+        let Some((settings, solver, bytes)) = cache.entries.pop_front() else {
+            break;
+        };
+        if Arc::strong_count(&solver) == 1 {
+            cache.retained_bytes = cache.retained_bytes.saturating_sub(bytes);
+        } else {
+            cache.entries.push_back((settings, solver, bytes));
+            checked += 1;
+        }
+    }
 }
 
 fn response_json(result: Result<Vec<u32>, String>) -> CString {
@@ -282,13 +467,34 @@ pub extern "C" fn donatello_abi_version() -> u32 {
     ABI_VERSION
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn donatello_cache_set_budget_bytes(bytes: usize) {
+    CACHE_BUDGET.store(bytes, Ordering::Relaxed);
+    trim_solution_cache();
+    trim_solver_cache();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn donatello_cache_clear() {
+    if let Some(cache) = SOLUTION_CACHE.get() {
+        *cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = SolutionCache::default();
+    }
+    if let Some(cache) = SOLVER_CACHE.get() {
+        *cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = SolverCache::default();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn request(condition: u8) -> Vec<u8> {
         format!(
-            r#"{{"abiVersion":2,"maxCp":500,"maxDurability":40,"maxProgress":500,"maxQuality":500,"baseProgress":100,"baseQuality":100,"jobLevel":100,"manipulation":true,"specialist":false,"backloadProgress":false,"root":{{"cp":500,"durability":40,"progress":0,"quality":0,"innerQuiet":0,"wasteNot":0,"manipulation":0,"innovation":0,"veneration":0,"greatStrides":0,"muscleMemory":0,"finalAppraisal":0,"carefulObservationCharges":0,"combo":3,"heartAndSoulActive":false,"heartAndSoulAvailable":false,"quickInnovationAvailable":false,"trainedPerfectionActive":false,"trainedPerfectionAvailable":true,"expedience":false,"condition":{condition},"crafterDelineations":0}}}}"#
+            r#"{{"abiVersion":3,"maxCp":500,"maxDurability":40,"maxProgress":500,"maxQuality":500,"baseProgress":100,"baseQuality":100,"jobLevel":100,"manipulation":true,"specialist":false,"backloadProgress":false,"minimizeSteps":false,"root":{{"cp":500,"durability":40,"progress":0,"quality":0,"innerQuiet":0,"wasteNot":0,"manipulation":0,"innovation":0,"veneration":0,"greatStrides":0,"muscleMemory":0,"finalAppraisal":0,"carefulObservationCharges":0,"combo":3,"heartAndSoulActive":false,"heartAndSoulAvailable":false,"quickInnovationAvailable":false,"trainedPerfectionActive":false,"trainedPerfectionAvailable":true,"expedience":false,"condition":{condition},"crafterDelineations":0}}}}"#
         )
         .into_bytes()
     }
@@ -318,7 +524,7 @@ mod tests {
 
     #[test]
     fn abi_version_is_stable() {
-        assert_eq!(donatello_abi_version(), 2);
+        assert_eq!(donatello_abi_version(), 3);
     }
 
     #[test]
@@ -408,5 +614,38 @@ mod tests {
             &cached_solver(settings),
             &cached_solver(settings)
         ));
+    }
+
+    #[test]
+    fn exact_result_key_distinguishes_condition_state_and_objective() {
+        let settings = SolverSettings {
+            simulator_settings: Settings {
+                max_cp: 10,
+                max_durability: 10,
+                max_progress: 10,
+                max_quality: 10,
+                base_progress: 10,
+                base_quality: 10,
+                job_level: 1,
+                allowed_actions: ActionMask::none(),
+                adversarial: false,
+                backload_progress: false,
+                stellar_steady_hand_charges: 0,
+            },
+            allow_non_max_quality_solutions: true,
+        };
+        let state = SimulationState::new(&settings.simulator_settings);
+        let key = (settings, state, Condition::Normal, false);
+        assert_ne!(key, (settings, state, Condition::Good, false));
+        assert_ne!(
+            key,
+            (
+                settings,
+                SimulationState { cp: 9, ..state },
+                Condition::Normal,
+                false
+            )
+        );
+        assert_ne!(key, (settings, state, Condition::Normal, true));
     }
 }

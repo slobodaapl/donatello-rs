@@ -650,8 +650,8 @@ fn high_max_stellar_steady_hand_charges() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 43468032,
-                processed_nodes: 13519786,
+                inserted_nodes: 43468864,
+                processed_nodes: 13519956,
             },
             finish_solver_stats: FinishSolverStats {
                 states: 89742,
@@ -664,8 +664,8 @@ fn high_max_stellar_steady_hand_charges() {
             },
             step_lb_stats: StepLbSolverStats {
                 states_on_main: 11719233,
-                states_on_shards: 2970491,
-                values: 308218111,
+                states_on_shards: 2970492,
+                values: 308218113,
             },
         }
     "#]];

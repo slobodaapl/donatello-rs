@@ -5,15 +5,14 @@ use crate::{
     utils::{self, ParetoFrontBuilder, ParetoValue},
 };
 
-use bump_scope::{BumpPool, BumpPoolGuard};
 use raphael_sim::*;
 use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
 use rustc_hash::FxHashMap;
 
 use super::state::ReducedState;
 
-pub type ParetoFront = nunny::Slice<ParetoValue>;
-pub type SolvedStates<'alloc> = FxHashMap<ReducedState, &'alloc ParetoFront>;
+pub type ParetoFront = Box<[ParetoValue]>;
+pub type SolvedStates = FxHashMap<ReducedState, ParetoFront>;
 
 #[derive(Default, Debug, Clone, Copy)]
 pub struct QualityUbSolverStats {
@@ -23,8 +22,7 @@ pub struct QualityUbSolverStats {
 }
 
 #[derive(Clone)]
-struct QualityUbSolverContext<'alloc> {
-    allocator: &'alloc BumpPool,
+struct QualityUbSolverContext {
     settings: SolverSettings,
     interrupt_signal: utils::AtomicFlag,
     iq_quality_lut: [u16; 11],
@@ -33,32 +31,28 @@ struct QualityUbSolverContext<'alloc> {
 }
 
 #[derive(Debug, Clone, Default)]
-struct TemplateRecord<'alloc> {
+struct TemplateRecord {
     /// Indexed by `(cp - min_solved_cp) / 2`
-    slots: Vec<Option<&'alloc ParetoFront>>,
+    slots: Vec<Option<ParetoFront>>,
     /// Minimum CP at which the template reaches max Progress and max Quality,
     /// or `None` if it never does.
     required_cp_for_max: Option<u16>,
 }
 
-pub struct QualityUbSolver<'alloc> {
-    context: QualityUbSolverContext<'alloc>,
-    templates: FxHashMap<TemplateData, TemplateRecord<'alloc>>,
+pub struct QualityUbSolver {
+    context: QualityUbSolverContext,
+    templates: FxHashMap<TemplateData, TemplateRecord>,
     stats: QualityUbSolverStats,
 }
 
-pub struct QualityUbSolverShard<'main, 'alloc> {
-    context: &'main QualityUbSolverContext<'alloc>,
-    templates: &'main FxHashMap<TemplateData, TemplateRecord<'alloc>>,
-    local_states: SolvedStates<'alloc>,
+pub struct QualityUbSolverShard<'main> {
+    context: &'main QualityUbSolverContext,
+    templates: &'main FxHashMap<TemplateData, TemplateRecord>,
+    local_states: SolvedStates,
 }
 
-impl<'alloc> QualityUbSolver<'alloc> {
-    pub fn new(
-        mut settings: SolverSettings,
-        interrupt_signal: utils::AtomicFlag,
-        allocator: &'alloc BumpPool,
-    ) -> Self {
+impl QualityUbSolver {
+    pub fn new(mut settings: SolverSettings, interrupt_signal: utils::AtomicFlag) -> Self {
         let durability_cost = durability_cost(&settings.simulator_settings);
         settings.simulator_settings.max_cp = {
             let initial_state = SimulationState::new(&settings.simulator_settings);
@@ -66,7 +60,6 @@ impl<'alloc> QualityUbSolver<'alloc> {
         };
         Self {
             context: QualityUbSolverContext {
-                allocator,
                 settings,
                 interrupt_signal,
                 iq_quality_lut: utils::compute_iq_quality_lut(&settings),
@@ -80,7 +73,7 @@ impl<'alloc> QualityUbSolver<'alloc> {
         }
     }
 
-    pub fn extend_solved_states(&mut self, new_solved_states: SolvedStates<'alloc>) {
+    pub fn extend_solved_states(&mut self, new_solved_states: SolvedStates) {
         let min_solved_cp = self.min_solved_cp();
         for (state, pareto_front) in new_solved_states {
             let key = TemplateData::new(state.effects, state.compressed_unreliable_quality);
@@ -90,14 +83,23 @@ impl<'alloc> QualityUbSolver<'alloc> {
                 slots.resize_with(index + 1, Default::default);
             }
             if slots[index].is_none() {
+                let pareto_len = pareto_front.len();
                 slots[index] = Some(pareto_front);
                 self.stats.states_on_shards += 1;
-                self.stats.values += pareto_front.len();
+                self.stats.values += pareto_len;
             }
         }
     }
 
-    pub fn create_shard<'main>(&'main self) -> QualityUbSolverShard<'main, 'alloc> {
+    pub fn set_interrupt_signal(&mut self, interrupt_signal: utils::AtomicFlag) {
+        self.context.interrupt_signal = interrupt_signal;
+    }
+
+    pub fn is_precomputed(&self) -> bool {
+        !self.templates.is_empty()
+    }
+
+    pub fn create_shard(&self) -> QualityUbSolverShard<'_> {
         QualityUbSolverShard {
             context: &self.context,
             templates: &self.templates,
@@ -163,7 +165,7 @@ impl<'alloc> QualityUbSolver<'alloc> {
         2 * self.context.durability_cost
     }
 
-    fn lookup_slot(&self, state: &ReducedState) -> Option<&'alloc ParetoFront> {
+    fn lookup_slot(&self, state: &ReducedState) -> Option<&[ParetoValue]> {
         lookup_slot(&self.templates, self.min_solved_cp(), state)
     }
 
@@ -185,8 +187,6 @@ impl<'alloc> QualityUbSolver<'alloc> {
                 (template.data, record)
             })
             .collect();
-
-        let allocator = self.context.allocator.get();
 
         // States are computed in order of less CP to more CP.
         // States currently being computed assume that child states have already been computed.
@@ -244,17 +244,18 @@ impl<'alloc> QualityUbSolver<'alloc> {
                         .collect::<Result<Vec<_>, SolverException>>()?;
                     self.stats.states_on_main += solved_states.len();
                     for (template_data, pareto_front) in solved_states {
-                        let allocated = allocator.alloc_slice_copy(&pareto_front).into_ref();
-                        let length_checked = allocated.try_into().map_err(|_| {
-                            internal_error!(
+                        if pareto_front.is_empty() {
+                            return Err(internal_error!(
                                 "QualityUbSolver::precompute produced empty Pareto front.",
                                 self.context.settings
-                            )
-                        })?;
+                            ));
+                        }
+                        let pareto_len = pareto_front.len();
+                        let length_checked = pareto_front.into_boxed_slice();
                         let slots = &mut self.templates.get_mut(&template_data).unwrap().slots;
                         let index = usize::from((cp - min_solved_cp) / 2);
                         slots[index] = Some(length_checked);
-                        self.stats.values += pareto_front.len();
+                        self.stats.values += pareto_len;
                     }
                 }
                 for template in templates {
@@ -328,14 +329,33 @@ impl<'alloc> QualityUbSolver<'alloc> {
     pub fn runtime_stats(&self) -> QualityUbSolverStats {
         self.stats
     }
+
+    pub fn estimated_retained_bytes(&self) -> usize {
+        let table_bytes = self.templates.capacity()
+            * (std::mem::size_of::<TemplateData>() + std::mem::size_of::<TemplateRecord>() + 1);
+        let slot_bytes = self
+            .templates
+            .values()
+            .map(|record| {
+                record.slots.capacity() * std::mem::size_of::<Option<ParetoFront>>()
+                    + record
+                        .slots
+                        .iter()
+                        .flatten()
+                        .map(|front| front.len() * std::mem::size_of::<ParetoValue>())
+                        .sum::<usize>()
+            })
+            .sum::<usize>();
+        std::mem::size_of::<Self>() + table_bytes + slot_bytes
+    }
 }
 
-impl<'main, 'alloc> QualityUbSolverShard<'main, 'alloc> {
-    pub fn solved_states(self) -> SolvedStates<'alloc> {
+impl QualityUbSolverShard<'_> {
+    pub fn solved_states(self) -> SolvedStates {
         self.local_states
     }
 
-    fn lookup_shared(&self, state: &ReducedState) -> Option<&'alloc ParetoFront> {
+    fn lookup_shared(&self, state: &ReducedState) -> Option<&[ParetoValue]> {
         lookup_slot(self.templates, 2 * self.context.durability_cost, state)
     }
 
@@ -367,8 +387,8 @@ impl<'main, 'alloc> QualityUbSolverShard<'main, 'alloc> {
                 ..reduced_state
             };
             if let Some(pareto_front) = self.lookup_shared(&reduced_state)
-                && pareto_front.first().progress >= required_progress
-                && pareto_front.first().quality.saturating_add(state.quality)
+                && pareto_front[0].progress >= required_progress
+                && pareto_front[0].quality.saturating_add(state.quality)
                     >= self.context.settings.max_quality()
             {
                 return Ok(self.context.settings.max_quality());
@@ -381,13 +401,12 @@ impl<'main, 'alloc> QualityUbSolverShard<'main, 'alloc> {
 
         let pareto_front = if let Some(pareto_front) = self.lookup_shared(&reduced_state) {
             pareto_front
-        } else if let Some(pareto_front) = self.local_states.get(&reduced_state).copied() {
-            pareto_front
+        } else if let Some(pareto_front) = self.local_states.get(&reduced_state) {
+            pareto_front.as_ref()
         } else {
-            let allocator = self.context.allocator.get();
-            self.solve_state(reduced_state, &allocator)?;
-            if let Some(pareto_front) = self.local_states.get(&reduced_state).copied() {
-                pareto_front
+            self.solve_state(reduced_state)?;
+            if let Some(pareto_front) = self.local_states.get(&reduced_state) {
+                pareto_front.as_ref()
             } else {
                 return Err(internal_error!(
                     "State not found in memoization table after solve.",
@@ -403,11 +422,7 @@ impl<'main, 'alloc> QualityUbSolverShard<'main, 'alloc> {
         Ok(std::cmp::min(self.context.settings.max_quality(), quality))
     }
 
-    fn solve_state(
-        &mut self,
-        state: ReducedState,
-        allocator: &BumpPoolGuard<'alloc>,
-    ) -> Result<(), SolverException> {
+    fn solve_state(&mut self, state: ReducedState) -> Result<(), SolverException> {
         if self.context.interrupt_signal.is_set() {
             return Err(SolverException::Interrupted);
         }
@@ -434,14 +449,14 @@ impl<'main, 'alloc> QualityUbSolverShard<'main, 'alloc> {
                         if let Some(child_pareto_front) = self.lookup_shared(&child_state) {
                             child_pareto_front
                         } else if let Some(child_pareto_front) =
-                            self.local_states.get(&child_state).copied()
+                            self.local_states.get(&child_state).map(Box::as_ref)
                         {
                             child_pareto_front
                         } else {
-                            self.solve_state(child_state, allocator)?;
+                            self.solve_state(child_state)?;
                             self.local_states
                                 .get(&child_state)
-                                .copied()
+                                .map(Box::as_ref)
                                 .ok_or_else(|| {
                                     internal_error!(
                                         "State not found in memoization table after solving.",
@@ -463,30 +478,29 @@ impl<'main, 'alloc> QualityUbSolverShard<'main, 'alloc> {
                 }
             }
         }
-        let pareto_front = allocator
-            .alloc_slice_copy(pareto_front_builder.result_as_slice())
-            .into_ref();
-        let pareto_front = pareto_front.try_into().map_err(|_| {
-            internal_error!(
+        let pareto_front = pareto_front_builder.result_as_slice();
+        if pareto_front.is_empty() {
+            return Err(internal_error!(
                 "Solver produced empty Pareto front.",
                 self.context.settings,
                 state
-            )
-        })?;
-        self.local_states.insert(state, pareto_front);
+            ));
+        }
+        self.local_states
+            .insert(state, pareto_front.to_vec().into_boxed_slice());
         Ok(())
     }
 }
 
-fn lookup_slot<'alloc>(
-    templates: &FxHashMap<TemplateData, TemplateRecord<'alloc>>,
+fn lookup_slot<'a>(
+    templates: &'a FxHashMap<TemplateData, TemplateRecord>,
     min_solved_cp: u16,
     state: &ReducedState,
-) -> Option<&'alloc ParetoFront> {
+) -> Option<&'a [ParetoValue]> {
     let data = TemplateData::new(state.effects, state.compressed_unreliable_quality);
     let record = templates.get(&data)?;
     let index = usize::from(state.cp.checked_sub(min_solved_cp)? / 2);
-    *record.slots.get(index)?
+    record.slots.get(index)?.as_deref()
 }
 
 /// Calculates the CP cost to "magically" restore 5 durability

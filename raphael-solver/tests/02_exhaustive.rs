@@ -359,8 +359,8 @@ fn rarefied_tacos_de_carne_asada_4785_4758() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 13408035,
-                processed_nodes: 1597684,
+                inserted_nodes: 13407779,
+                processed_nodes: 1597662,
             },
             finish_solver_stats: FinishSolverStats {
                 states: 15891,
@@ -544,9 +544,9 @@ fn stuffed_peppers_2_quick_innovation() {
                 values: 21872319,
             },
             step_lb_stats: StepLbSolverStats {
-                states_on_main: 378448,
-                states_on_shards: 159329,
-                values: 9141421,
+                states_on_main: 673403,
+                states_on_shards: 305635,
+                values: 16922918,
             },
         }
     "#]];
@@ -909,8 +909,8 @@ fn hardened_survey_plank_5558_5216() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 18326527,
-                processed_nodes: 2024196,
+                inserted_nodes: 18326463,
+                processed_nodes: 2024189,
             },
             finish_solver_stats: FinishSolverStats {
                 states: 3619,
@@ -963,8 +963,8 @@ fn hardened_survey_plank_5558_5216_heart_and_soul_quick_innovation() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 1320583,
-                processed_nodes: 113351,
+                inserted_nodes: 1783215,
+                processed_nodes: 114458,
             },
             finish_solver_stats: FinishSolverStats {
                 states: 6867,
@@ -1129,8 +1129,8 @@ fn ce_stellar_steady_hand() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 1586537,
-                processed_nodes: 366678,
+                inserted_nodes: 1586567,
+                processed_nodes: 366683,
             },
             finish_solver_stats: FinishSolverStats {
                 states: 10207,
@@ -1184,8 +1184,8 @@ fn ce_stellar_steady_hand_2() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 1446535,
-                processed_nodes: 150173,
+                inserted_nodes: 1446553,
+                processed_nodes: 150176,
             },
             finish_solver_stats: FinishSolverStats {
                 states: 16581,

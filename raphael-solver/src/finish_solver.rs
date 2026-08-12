@@ -203,6 +203,19 @@ impl FinishSolver {
                 .sum(),
         }
     }
+
+    pub fn estimated_retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.solved_states.capacity()
+                * (std::mem::size_of::<(u16, Effects)>()
+                    + std::mem::size_of::<CpProgressBreakpoints>()
+                    + 1)
+            + self
+                .solved_states
+                .values()
+                .map(|value| value.breakpoints.capacity() * std::mem::size_of::<Breakpoint>())
+                .sum::<usize>()
+    }
 }
 
 #[derive(Debug)]

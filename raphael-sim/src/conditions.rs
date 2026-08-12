@@ -14,6 +14,7 @@ pub enum Condition {
 }
 
 impl Condition {
+    #[must_use]
     pub const fn deterministic_successor(self) -> Self {
         match self {
             Self::Excellent => Self::Poor,

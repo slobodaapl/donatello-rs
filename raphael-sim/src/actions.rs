@@ -1461,4 +1461,60 @@ impl Action {
             Self::FinalAppraisal => 19012,
         }
     }
+
+    pub const fn from_action_id(action_id: u32) -> Option<Self> {
+        Some(match action_id {
+            100001 => Self::BasicSynthesis,
+            100002 => Self::BasicTouch,
+            100003 => Self::MasterMend,
+            100010 => Self::Observe,
+            100371 => Self::TricksOfTheTrade,
+            4631 => Self::WasteNot,
+            19297 => Self::Veneration,
+            100004 => Self::StandardTouch,
+            260 => Self::GreatStrides,
+            19004 => Self::Innovation,
+            4639 => Self::WasteNot2,
+            100339 => Self::ByregotsBlessing,
+            100128 => Self::PreciseTouch,
+            100379 => Self::MuscleMemory,
+            100203 => Self::CarefulSynthesis,
+            4574 => Self::Manipulation,
+            100227 => Self::PrudentTouch,
+            100411 => Self::AdvancedTouch,
+            100387 => Self::Reflect,
+            100299 => Self::PreparatoryTouch,
+            100403 => Self::Groundwork,
+            100323 => Self::DelicateSynthesis,
+            100315 => Self::IntensiveSynthesis,
+            100283 => Self::TrainedEye,
+            100419 => Self::HeartAndSoul,
+            100427 => Self::PrudentSynthesis,
+            100435 => Self::TrainedFinesse,
+            100443 => Self::RefinedTouch,
+            100459 => Self::QuickInnovation,
+            100467 => Self::ImmaculateMend,
+            100475 => Self::TrainedPerfection,
+            46843 => Self::StellarSteadyHand,
+            100363 => Self::RapidSynthesis,
+            100355 => Self::HastyTouch,
+            100451 => Self::DaringTouch,
+            19012 => Self::FinalAppraisal,
+            _ => return None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod action_id_tests {
+    use super::Action;
+    use strum::IntoEnumIterator;
+
+    #[test]
+    fn action_ids_round_trip() {
+        for action in Action::iter() {
+            assert_eq!(Action::from_action_id(action.action_id()), Some(action));
+        }
+        assert_eq!(Action::from_action_id(u32::MAX), None);
+    }
 }

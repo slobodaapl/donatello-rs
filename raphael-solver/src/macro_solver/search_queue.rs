@@ -140,6 +140,37 @@ impl SearchQueue {
         Ok(())
     }
 
+    pub fn push_batch(
+        &mut self,
+        mut candidates: Vec<(SearchScore, ActionCombo, usize)>,
+    ) -> Result<(), SolverException> {
+        candidates.par_sort_unstable_by_key(|candidate| candidate.0);
+        let mut begin = 0;
+        while begin < candidates.len() {
+            let score = candidates[begin].0;
+            let end = begin + candidates[begin..].partition_point(|candidate| candidate.0 == score);
+            let mut nodes = Vec::with_capacity(end - begin);
+            for &(_, action, parent_idx) in &candidates[begin..end] {
+                nodes.push(
+                    SearchNode::new()
+                        .with_parent_idx_checked(parent_idx)
+                        .map_err(|_| SolverException::SearchQueueCapacityExceeded)?
+                        .with_action(action),
+                );
+            }
+            match self.batches.entry(score) {
+                Entry::Occupied(entry) => entry.into_mut().extend(nodes),
+                Entry::Vacant(entry) => {
+                    self.batch_ordering.insert(score);
+                    entry.insert(nodes);
+                }
+            }
+            self.num_inserted_nodes += end - begin;
+            begin = end;
+        }
+        Ok(())
+    }
+
     pub fn drop_nodes_below_score(&mut self, min_score: SearchScore) {
         let mut dropped = 0;
         while let Some(&score) = self.batch_ordering.first()

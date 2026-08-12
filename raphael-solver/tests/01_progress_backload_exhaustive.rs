@@ -359,7 +359,7 @@ fn rarefied_tacos_de_carne_asada_4785_4758() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 431806,
+                inserted_nodes: 431839,
                 processed_nodes: 70816,
             },
             finish_solver_stats: FinishSolverStats {
@@ -539,14 +539,14 @@ fn stuffed_peppers_2_quick_innovation() {
                 values: 210965,
             },
             quality_ub_stats: QualityUbSolverStats {
-                states_on_main: 1477069,
+                states_on_main: 1491068,
                 states_on_shards: 15,
-                values: 17827213,
+                values: 17841212,
             },
             step_lb_stats: StepLbSolverStats {
-                states_on_main: 432530,
-                states_on_shards: 170200,
-                values: 5794412,
+                states_on_main: 786391,
+                states_on_shards: 322603,
+                values: 10948807,
             },
         }
     "#]];
@@ -693,8 +693,8 @@ fn claro_walnut_lumber_4900_4800() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 503314,
-                processed_nodes: 28602,
+                inserted_nodes: 503332,
+                processed_nodes: 28603,
             },
             finish_solver_stats: FinishSolverStats {
                 states: 8079,
@@ -909,8 +909,8 @@ fn hardened_survey_plank_5558_5216() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 1228940,
-                processed_nodes: 172691,
+                inserted_nodes: 1228882,
+                processed_nodes: 172679,
             },
             finish_solver_stats: FinishSolverStats {
                 states: 3619,

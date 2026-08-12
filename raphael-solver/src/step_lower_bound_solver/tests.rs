@@ -1,4 +1,3 @@
-use bump_scope::BumpPool;
 use raphael_sim::*;
 
 use crate::{
@@ -13,8 +12,7 @@ use super::*;
 /// It is consistent if the step-lb of a parent state is never greater than the step-lb of a child state.
 /// It is admissible if the step-lb of a state is never greater than the step count of a reachable final state.
 fn check_consistency(solver_settings: SolverSettings) {
-    let allocator = BumpPool::default();
-    let mut solver = StepLbSolver::new(solver_settings, AtomicFlag::default(), &allocator);
+    let mut solver = StepLbSolver::new(solver_settings, AtomicFlag::default());
     for state in generate_random_states(solver_settings, 1_000_000)
         .filter(|state| state.effects.combo() == Combo::None)
     {
@@ -67,8 +65,7 @@ fn step_lower_bound_unreachable_quality_no_panic() {
         simulator_settings,
         allow_non_max_quality_solutions: false,
     };
-    let allocator = BumpPool::default();
-    let mut solver = StepLbSolver::new(solver_settings, AtomicFlag::default(), &allocator);
+    let mut solver = StepLbSolver::new(solver_settings, AtomicFlag::default());
     let initial_state = SimulationState::new(&simulator_settings);
     let result = solver.step_lower_bound(initial_state, 0).unwrap();
     assert_eq!(result, u8::MAX);

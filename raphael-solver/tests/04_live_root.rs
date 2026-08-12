@@ -78,6 +78,71 @@ fn arbitrary_root_preserves_resources_and_progress() {
 }
 
 #[test]
+fn completing_incumbent_preserves_the_optimal_live_result() {
+    let settings = settings(
+        ActionMask::none()
+            .add(Action::BasicSynthesis)
+            .add(Action::CarefulSynthesis),
+    );
+    let root = SimulationState::new(&settings);
+    let mut solver = solver(settings);
+    let optimum = solver
+        .solve_from_state_with_condition(root, Condition::Good)
+        .unwrap();
+    let seeded = solver
+        .solve_from_state_with_condition_and_incumbent(
+            root,
+            Condition::Good,
+            &[
+                Action::BasicSynthesis,
+                Action::BasicSynthesis,
+                Action::BasicSynthesis,
+                Action::BasicSynthesis,
+            ],
+        )
+        .unwrap();
+    assert_eq!(seeded, optimum);
+}
+
+#[test]
+fn invalid_incumbent_is_ignored() {
+    let settings = settings(ActionMask::none().add(Action::BasicSynthesis));
+    let root = SimulationState::new(&settings);
+    let result = solver(settings)
+        .solve_from_state_with_condition_and_incumbent(root, Condition::Good, &[Action::BasicTouch])
+        .unwrap();
+    assert_eq!(result, [Action::BasicSynthesis; 4]);
+}
+
+#[test]
+fn quality_only_replan_returns_a_max_quality_incumbent_without_search() {
+    let mut settings = settings(
+        ActionMask::none()
+            .add(Action::BasicSynthesis)
+            .add(Action::BasicTouch),
+    );
+    settings.max_progress = 200;
+    settings.max_quality = 100;
+    let root = SimulationState::new(&settings);
+    let incumbent = [
+        Action::BasicTouch,
+        Action::BasicSynthesis,
+        Action::BasicSynthesis,
+    ];
+    let mut solver = solver(settings);
+    let result = solver
+        .solve_from_state_with_condition_and_incumbent_objective(
+            root,
+            Condition::Normal,
+            &incumbent,
+            false,
+        )
+        .unwrap();
+    assert_eq!(result, incumbent);
+    assert_eq!(solver.runtime_stats().search_queue_stats.processed_nodes, 0);
+}
+
+#[test]
 fn every_supported_prefix_rejoins_normal_search_without_bound_failure() {
     let mut settings = settings(
         ActionMask::none()

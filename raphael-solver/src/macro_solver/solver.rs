@@ -1,4 +1,3 @@
-use bump_scope::BumpPool;
 use raphael_sim::*;
 use rayon::prelude::*;
 
@@ -51,6 +50,8 @@ pub struct MacroSolver<'a> {
     solution_callback: Box<SolutionCallback<'a>>,
     progress_callback: Box<ProgressCallback<'a>>,
     finish_solver: FinishSolver,
+    quality_ub_solver: QualityUbSolver,
+    step_lb_solver: StepLbSolver,
     interrupt_signal: AtomicFlag,
     last_solve_runtime_stats: MacroSolverStats,
 }
@@ -62,11 +63,15 @@ impl<'a> MacroSolver<'a> {
         progress_callback: Box<ProgressCallback<'a>>,
         interrupt_signal: AtomicFlag,
     ) -> Self {
+        let quality_ub_solver = QualityUbSolver::new(settings, interrupt_signal.clone());
+        let step_lb_solver = StepLbSolver::new(settings, interrupt_signal.clone());
         Self {
             settings,
             solution_callback,
             progress_callback,
             finish_solver: FinishSolver::new(settings),
+            quality_ub_solver,
+            step_lb_solver,
             interrupt_signal,
             last_solve_runtime_stats: MacroSolverStats::default(),
         }
@@ -78,6 +83,10 @@ impl<'a> MacroSolver<'a> {
 
     pub fn set_interrupt_signal(&mut self, interrupt_signal: AtomicFlag) {
         self.interrupt_signal = interrupt_signal;
+        self.quality_ub_solver
+            .set_interrupt_signal(self.interrupt_signal.clone());
+        self.step_lb_solver
+            .set_interrupt_signal(self.interrupt_signal.clone());
     }
 
     /// Solve the complete remaining synthesis from an authoritative live state.
@@ -96,18 +105,40 @@ impl<'a> MacroSolver<'a> {
         initial_state: SimulationState,
         condition: Condition,
     ) -> Result<Vec<Action>, SolverException> {
+        self.solve_from_state_with_condition_and_incumbent(initial_state, condition, &[])
+    }
+
+    /// Solve from a live state, using a known completing suffix as the initial branch-and-bound
+    /// floor. Invalid or non-completing incumbents are ignored.
+    pub fn solve_from_state_with_condition_and_incumbent(
+        &mut self,
+        initial_state: SimulationState,
+        condition: Condition,
+        incumbent_actions: &[Action],
+    ) -> Result<Vec<Action>, SolverException> {
+        self.solve_from_state_with_condition_and_incumbent_objective(
+            initial_state,
+            condition,
+            incumbent_actions,
+            true,
+        )
+    }
+
+    /// Solve from a live state. When `minimize_steps` is false, secondary step/duration
+    /// optimization is disabled and the first proven maximum-quality solution terminates search.
+    pub fn solve_from_state_with_condition_and_incumbent_objective(
+        &mut self,
+        initial_state: SimulationState,
+        condition: Condition,
+        incumbent_actions: &[Action],
+        minimize_steps: bool,
+    ) -> Result<Vec<Action>, SolverException> {
         log::debug!(
             "rayon::current_num_threads() = {}",
             rayon::current_num_threads()
         );
 
         self.last_solve_runtime_stats = MacroSolverStats::default();
-        let allocator = BumpPool::default();
-        let mut quality_ub_solver =
-            QualityUbSolver::new(self.settings, self.interrupt_signal.clone(), &allocator);
-        let mut step_lb_solver =
-            StepLbSolver::new(self.settings, self.interrupt_signal.clone(), &allocator);
-
         let _total_time = ScopedTimer::new("Total Time");
 
         let timer = ScopedTimer::new("Finish Solver");
@@ -121,33 +152,34 @@ impl<'a> MacroSolver<'a> {
         drop(timer);
 
         let timer = ScopedTimer::new("Quality UB Solver");
-        quality_ub_solver.precompute()?;
+        if !self.quality_ub_solver.is_precomputed() {
+            self.quality_ub_solver.precompute()?;
+        }
         drop(timer);
 
         // The StepLbSolver is only queried when a state has the potential to reach max_quality.
         // If the quality upper-bound of the initial state is less than max_quality, then no
         // subsequent state can reach max_quality, which in turn means the StepLbSolver is not needed.
         let initial_state_quality_ub = if condition == Condition::Normal {
-            let mut shard = quality_ub_solver.create_shard();
+            let mut shard = self.quality_ub_solver.create_shard();
             let result = shard.quality_upper_bound(initial_state)?;
-            quality_ub_solver.extend_solved_states(shard.solved_states());
+            self.quality_ub_solver
+                .extend_solved_states(shard.solved_states());
             result
         } else {
             self.settings.max_quality()
         };
         if initial_state_quality_ub >= self.settings.max_quality() {
             let _timer = ScopedTimer::new("Step LB Solver");
-            step_lb_solver.precompute()?;
+            if !self.step_lb_solver.is_precomputed() {
+                self.step_lb_solver.precompute()?;
+            }
         }
 
         let timer = ScopedTimer::new("Search");
+        let incumbent = self.incumbent_solution(initial_state, condition, incumbent_actions);
         let actions = self
-            .do_solve(
-                &mut quality_ub_solver,
-                &mut step_lb_solver,
-                initial_state,
-                condition,
-            )?
+            .do_solve(initial_state, condition, incumbent, minimize_steps)?
             .actions();
         drop(timer);
 
@@ -156,16 +188,72 @@ impl<'a> MacroSolver<'a> {
         Ok(actions)
     }
 
-    fn do_solve<'alloc>(
+    fn incumbent_solution(
+        &self,
+        mut state: SimulationState,
+        mut condition: Condition,
+        actions: &[Action],
+    ) -> Option<Solution> {
+        let mut solver_actions = Vec::with_capacity(actions.len());
+        let mut duration = 0_u8;
+        for &action in actions {
+            if state.is_final(&self.settings.simulator_settings) {
+                break;
+            }
+            (state, condition) = use_action_combo_with_condition(
+                &self.settings,
+                state,
+                ActionCombo::Single(action),
+                condition,
+            )
+            .ok()?;
+            duration = duration.checked_add(action.time_cost())?;
+            solver_actions.push(ActionCombo::Single(action));
+        }
+        if state.progress < self.settings.max_progress() {
+            return None;
+        }
+        let steps = u8::try_from(solver_actions.len()).ok()?;
+        let score = SearchScore {
+            quality_upper_bound: state.quality.min(self.settings.max_quality()),
+            steps_lower_bound: steps,
+            duration_lower_bound: duration,
+            current_steps: steps,
+            current_duration: duration,
+        };
+        Some(Solution {
+            score: (score, 0),
+            solver_actions,
+        })
+    }
+
+    fn do_solve(
         &mut self,
-        quality_ub_solver: &mut QualityUbSolver<'alloc>,
-        step_lb_solver: &mut StepLbSolver<'alloc>,
         state: SimulationState,
         condition: Condition,
+        incumbent: Option<Solution>,
+        minimize_steps: bool,
     ) -> Result<Solution, SolverException> {
         let mut search_queue = SearchQueue::new(self.settings, state, condition);
-        let mut solution: Option<Solution> = None;
-        let mut min_accepted_score = SearchScore::MIN;
+        let mut solution = incumbent;
+        if !minimize_steps
+            && solution.as_ref().is_some_and(|solution| {
+                solution.score.0.quality_upper_bound >= self.settings.max_quality()
+            })
+        {
+            return Ok(solution.unwrap());
+        }
+        let score_floor = |solution: &Solution| {
+            if minimize_steps {
+                solution.score.0
+            } else {
+                SearchScore {
+                    quality_upper_bound: solution.score.0.quality_upper_bound.saturating_add(1),
+                    ..SearchScore::MIN
+                }
+            }
+        };
+        let mut min_accepted_score = solution.as_ref().map_or(SearchScore::MIN, score_floor);
 
         while let Some(Batch {
             score,
@@ -180,8 +268,8 @@ impl<'a> MacroSolver<'a> {
             let create_worker_data = || WorkerData {
                 settings: &self.settings,
                 finish_solver: &self.finish_solver,
-                quality_ub_solver_shard: quality_ub_solver.create_shard(),
-                step_lb_solver_shard: step_lb_solver.create_shard(),
+                quality_ub_solver_shard: self.quality_ub_solver.create_shard(),
+                step_lb_solver_shard: self.step_lb_solver.create_shard(),
                 search_queue: &search_queue,
                 min_accepted_score,
                 candidate_states: Vec::new(),
@@ -208,7 +296,11 @@ impl<'a> MacroSolver<'a> {
             // Update the current best intermediate solution.
             for worker_data in &worker_results {
                 if let Some(worker_solution) = worker_data.best_intermediate_solution.as_ref()
-                    && Some(worker_solution.score) > solution.as_ref().map(|s| s.score)
+                    && (solution.is_none()
+                        || worker_solution.score.0.quality_upper_bound
+                            > solution.as_ref().unwrap().score.0.quality_upper_bound
+                        || (minimize_steps
+                            && Some(worker_solution.score) > solution.as_ref().map(|s| s.score)))
                 {
                     solution = Some(worker_solution.clone());
                     (self.solution_callback)(&solution.as_ref().unwrap().actions());
@@ -220,21 +312,47 @@ impl<'a> MacroSolver<'a> {
                 .map(|result| result.min_accepted_score)
                 .max()
                 .unwrap_or(min_accepted_score);
+            if !minimize_steps {
+                if let Some(best) = solution.as_ref() {
+                    min_accepted_score = score_floor(best);
+                }
+                if solution.as_ref().is_some_and(|solution| {
+                    solution.score.0.quality_upper_bound >= self.settings.max_quality()
+                }) {
+                    break;
+                }
+            }
             search_queue.drop_nodes_below_score(min_accepted_score);
 
-            // Add all eligible candidate states to the search queue.
-            for worker_data in &worker_results {
-                for &(score, action, parent_id) in &worker_data.candidate_states {
-                    if score >= min_accepted_score {
-                        search_queue.push(score, action, parent_id)?;
-                    }
+            // Filter once, then group equal scores so the ordered queue is updated once per
+            // distinct score instead of once per candidate node.
+            let candidate_count = worker_results
+                .iter()
+                .map(|worker| worker.candidate_states.len())
+                .sum::<usize>();
+            if candidate_count >= 4096 {
+                let candidates = worker_results
+                    .iter()
+                    .flat_map(|worker| worker.candidate_states.iter().copied())
+                    .filter(|(score, _, _)| *score >= min_accepted_score)
+                    .collect();
+                search_queue.push_batch(candidates)?;
+            } else {
+                for (score, action, parent_id) in worker_results
+                    .iter()
+                    .flat_map(|worker| worker.candidate_states.iter().copied())
+                    .filter(|(score, _, _)| *score >= min_accepted_score)
+                {
+                    search_queue.push(score, action, parent_id)?;
                 }
             }
 
             // Extend inner solvers with local states from all workers.
             for worker_result in worker_results {
-                quality_ub_solver.extend_solved_states(worker_result.quality_ub_states);
-                step_lb_solver.extend_solved_states(worker_result.step_lb_states);
+                self.quality_ub_solver
+                    .extend_solved_states(worker_result.quality_ub_states);
+                self.step_lb_solver
+                    .extend_solved_states(worker_result.step_lb_states);
             }
 
             (self.progress_callback)(search_queue.runtime_stats().processed_nodes);
@@ -243,8 +361,8 @@ impl<'a> MacroSolver<'a> {
         self.last_solve_runtime_stats = MacroSolverStats {
             search_queue_stats: search_queue.runtime_stats(),
             finish_solver_stats: self.finish_solver.runtime_stats(),
-            quality_ub_stats: quality_ub_solver.runtime_stats(),
-            step_lb_stats: step_lb_solver.runtime_stats(),
+            quality_ub_stats: self.quality_ub_solver.runtime_stats(),
+            step_lb_stats: self.step_lb_solver.runtime_stats(),
         };
 
         if let Some(solution) = &solution
@@ -260,29 +378,36 @@ impl<'a> MacroSolver<'a> {
     pub fn runtime_stats(&self) -> MacroSolverStats {
         self.last_solve_runtime_stats
     }
+
+    pub fn estimated_retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.finish_solver.estimated_retained_bytes()
+            + self.quality_ub_solver.estimated_retained_bytes()
+            + self.step_lb_solver.estimated_retained_bytes()
+    }
 }
 
-struct WorkerResult<'alloc> {
-    quality_ub_states: QualityUbStates<'alloc>,
-    step_lb_states: StepLbStates<'alloc>,
+struct WorkerResult {
+    quality_ub_states: QualityUbStates,
+    step_lb_states: StepLbStates,
     min_accepted_score: SearchScore,
     candidate_states: Vec<(SearchScore, ActionCombo, usize)>,
     best_intermediate_solution: Option<Solution>,
 }
 
-struct WorkerData<'main, 'alloc> {
+struct WorkerData<'main> {
     settings: &'main SolverSettings,
     finish_solver: &'main FinishSolver,
-    quality_ub_solver_shard: QualityUbSolverShard<'main, 'alloc>,
-    step_lb_solver_shard: StepLbSolverShard<'main, 'alloc>,
+    quality_ub_solver_shard: QualityUbSolverShard<'main>,
+    step_lb_solver_shard: StepLbSolverShard<'main>,
     search_queue: &'main SearchQueue,
     min_accepted_score: SearchScore,
     candidate_states: Vec<(SearchScore, ActionCombo, usize)>,
     best_intermediate_solution: Option<Solution>,
 }
 
-impl<'main, 'alloc> WorkerData<'main, 'alloc> {
-    fn finalize(self) -> WorkerResult<'alloc> {
+impl WorkerData<'_> {
+    fn finalize(self) -> WorkerResult {
         WorkerResult {
             quality_ub_states: self.quality_ub_solver_shard.solved_states(),
             step_lb_states: self.step_lb_solver_shard.solved_states(),

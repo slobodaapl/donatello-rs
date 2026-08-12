@@ -283,7 +283,11 @@ fn run_case(
         for (index, &root) in boundaries.iter().enumerate() {
             let incumbent = evaluate(&adaptive_settings, root, condition, &baseline[index..]);
             let solve_started = Instant::now();
-            let solved = donatello.solve_from_state_with_condition(root, condition);
+            let solved = donatello.solve_from_state_with_condition_and_incumbent(
+                root,
+                condition,
+                &baseline[index..],
+            );
             let candidate = solved
                 .map(|actions| evaluate(&adaptive_settings, root, condition, &actions))
                 .map_err(|error| {
