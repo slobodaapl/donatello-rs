@@ -57,6 +57,32 @@ pub struct Effects {
 }
 
 impl Effects {
+    /// Canonical representation of the shared Crafter's Delineation resource.
+    ///
+    /// Heart and Soul and Quick Innovation are one-shot actions sharing the same
+    /// consumable.  Keeping impossible availability/resource combinations out of
+    /// solver keys is critical: otherwise equivalent live roots miss precomputed
+    /// tables and trigger expensive dynamic solving.
+    #[must_use]
+    pub const fn canonicalize_specialist_resources(self) -> Self {
+        let usable_actions =
+            self.heart_and_soul_available() as u8 + self.quick_innovation_available() as u8;
+        let delineations = if self.crafter_delineations() < usable_actions {
+            self.crafter_delineations()
+        } else {
+            usable_actions
+        };
+        let effects = self.with_crafter_delineations(delineations);
+        if delineations == 0 {
+            // Heart and Soul may already be active after its delineation was spent.
+            effects
+                .with_heart_and_soul_available(false)
+                .with_quick_innovation_available(false)
+        } else {
+            effects
+        }
+    }
+
     /// Effects at synthesis begin
     pub fn initial(settings: &Settings) -> Self {
         let special_quality_state = match settings.adversarial {
@@ -130,6 +156,7 @@ impl Effects {
             .with_quick_innovation_available(false)
             .with_final_appraisal(0)
             .with_careful_observation_charges(0)
+            .canonicalize_specialist_resources()
     }
 }
 
@@ -194,5 +221,30 @@ impl SpecialQualityState {
             2 => Self::AdversarialGuard,
             _ => Self::AdversarialGuard2,
         }
+    }
+}
+
+#[cfg(test)]
+mod specialist_resource_tests {
+    use super::*;
+
+    #[test]
+    fn canonicalization_clamps_and_preserves_active_heart_and_soul() {
+        let effects = Effects::new()
+            .with_crafter_delineations(7)
+            .with_heart_and_soul_available(true)
+            .with_quick_innovation_available(false)
+            .canonicalize_specialist_resources();
+        assert_eq!(effects.crafter_delineations(), 1);
+
+        let effects = effects
+            .with_crafter_delineations(0)
+            .with_quick_innovation_available(true)
+            .with_heart_and_soul_active(true)
+            .canonicalize_specialist_resources();
+        assert_eq!(effects.crafter_delineations(), 0);
+        assert!(!effects.heart_and_soul_available());
+        assert!(!effects.quick_innovation_available());
+        assert!(effects.heart_and_soul_active());
     }
 }

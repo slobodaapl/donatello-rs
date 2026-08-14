@@ -34,7 +34,7 @@ fn check_consistency(solver_settings: SolverSettings) {
                     dbg!(state, action, state_step_lb, child_step_lb);
                     panic!("StepLbSolver is not consistent");
                 }
-            };
+            }
         }
     }
 }

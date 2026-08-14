@@ -164,9 +164,9 @@ impl SimulationState {
             }
             state.effects = state.effects.tick_down();
         } else if state.effects.stellar_steady_hand() != 0 {
-            state.effects.set_stellar_steady_hand(
-                state.effects.stellar_steady_hand().saturating_sub(1),
-            );
+            state
+                .effects
+                .set_stellar_steady_hand(state.effects.stellar_steady_hand().saturating_sub(1));
         }
 
         A::transform(&mut state, settings, condition);
@@ -221,6 +221,8 @@ impl SimulationState {
                 .effects
                 .set_special_quality_state(SpecialQualityState::AdversarialGuard);
         }
+
+        state.effects = state.effects.canonicalize_specialist_resources();
 
         Ok(state)
     }

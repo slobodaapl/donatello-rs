@@ -29,7 +29,10 @@ pub trait ActionImpl {
     fn progress_increase(state: &SimulationState, settings: &Settings) -> u16 {
         let action_mod = Self::progress_modifier(state, settings);
         let effect_mod = state.effects.progress_modifier();
-        let progress = u32::from(settings.base_progress) * action_mod * effect_mod / 1000;
+        let progress = u64::from(settings.base_progress)
+            .saturating_mul(u64::from(action_mod))
+            .saturating_mul(u64::from(effect_mod))
+            / 1000;
         progress.try_into().unwrap_or(u16::MAX)
     }
 
@@ -51,8 +54,11 @@ pub trait ActionImpl {
             | Condition::GoodOmen
             | Condition::Robust => 4,
         };
-        let quality =
-            u32::from(settings.base_quality) * action_mod * effect_mod * condition_mod / 40000;
+        let quality = u64::from(settings.base_quality)
+            .saturating_mul(u64::from(action_mod))
+            .saturating_mul(u64::from(effect_mod))
+            .saturating_mul(condition_mod as u64)
+            / 40000;
         quality.try_into().unwrap_or(u16::MAX)
     }
 

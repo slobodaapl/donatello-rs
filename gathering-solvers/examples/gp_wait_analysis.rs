@@ -1,6 +1,6 @@
 use gathering_solvers::{
-    solve, ActionModel, GatheringAction, LegacyOptions, Mechanics, RewardTier, SolveRequest,
-    SolverMode, State, WeightedGain,
+    ActionModel, GatheringAction, LegacyOptions, Mechanics, RewardTier, SolveRequest, SolverMode,
+    State, WeightedGain, solve,
 };
 
 fn request(gp: u16, rewards: Vec<RewardTier>) -> SolveRequest {

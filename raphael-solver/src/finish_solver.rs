@@ -231,8 +231,26 @@ fn generate_templates(settings: &SolverSettings) -> Vec<Template> {
     initial_state.cp = 1000;
     initial_state.effects = initial_state.effects.strip_quality_effects();
     let mut templates = FxHashSet::default();
-    templates.insert((initial_state.durability, initial_state.effects));
-    let mut stack = vec![initial_state];
+    let mut stack = Vec::new();
+    let mut specialist_roots = vec![(0, false, false)];
+    if settings
+        .simulator_settings
+        .is_action_allowed::<HeartAndSoul>()
+    {
+        specialist_roots.extend([(0, false, true), (1, true, false)]);
+    }
+    for (delineations, heart_and_soul_available, heart_and_soul_active) in specialist_roots {
+        let mut seed = initial_state;
+        seed.effects = seed
+            .effects
+            .with_crafter_delineations(delineations)
+            .with_heart_and_soul_available(heart_and_soul_available)
+            .with_heart_and_soul_active(heart_and_soul_active)
+            .canonicalize_specialist_resources();
+        if templates.insert((seed.durability, seed.effects)) {
+            stack.push(seed);
+        }
+    }
     while let Some(mut state) = stack.pop() {
         state
             .effects
@@ -259,4 +277,50 @@ fn generate_templates(settings: &SolverSettings) -> Vec<Template> {
             current_max_progress: None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings() -> SolverSettings {
+        SolverSettings {
+            simulator_settings: Settings {
+                max_cp: 300,
+                max_durability: 40,
+                max_progress: 500,
+                max_quality: 1000,
+                base_progress: 100,
+                base_quality: 100,
+                job_level: 100,
+                allowed_actions: ActionMask::regular()
+                    .add(Action::HeartAndSoul)
+                    .add(Action::QuickInnovation),
+                adversarial: false,
+                backload_progress: false,
+                stellar_steady_hand_charges: 0,
+            },
+            allow_non_max_quality_solutions: true,
+        }
+    }
+
+    #[test]
+    fn canonical_specialist_roots_have_precomputed_finish_bounds() {
+        let settings = settings();
+        let mut solver = FinishSolver::new(settings);
+        solver.precompute().unwrap();
+        for delineations in 0..=2 {
+            let mut root = SimulationState::new(&settings.simulator_settings);
+            root.effects.set_crafter_delineations(delineations);
+            root.effects = root
+                .effects
+                .canonicalize_specialist_resources()
+                .strip_quality_effects();
+            assert_ne!(
+                solver.can_finish(&root).unwrap(),
+                Finishability::Unknown,
+                "missing finish bound for {delineations} delineations"
+            );
+        }
+    }
 }

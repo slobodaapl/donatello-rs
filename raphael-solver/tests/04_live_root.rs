@@ -242,3 +242,98 @@ fn sturdy_prefix_preserves_a_known_completing_suffix() {
     }
     assert!(state.is_final(&settings));
 }
+
+#[test]
+fn late_sturdy_root_with_no_bound_continuation_preserves_incumbent() {
+    let settings = Settings {
+        max_cp: 738,
+        max_durability: 20,
+        max_progress: 4700,
+        max_quality: 14900,
+        base_progress: 290,
+        base_quality: 301,
+        job_level: 100,
+        allowed_actions: ActionMask::all()
+            .remove(Action::TrainedEye)
+            .remove(Action::HeartAndSoul)
+            .remove(Action::QuickInnovation)
+            .remove(Action::RapidSynthesis)
+            .remove(Action::HastyTouch)
+            .remove(Action::DaringTouch),
+        adversarial: false,
+        backload_progress: false,
+        stellar_steady_hand_charges: 0,
+    };
+    let root = SimulationState {
+        cp: 67,
+        durability: 15,
+        progress: 4219,
+        quality: 8100,
+        effects: SimulationState::new(&settings)
+            .effects
+            .with_inner_quiet(10)
+            .with_innovation(2),
+        ..SimulationState::new(&settings)
+    };
+    let incumbent = [
+        Action::GreatStrides,
+        Action::ByregotsBlessing,
+        Action::CarefulSynthesis,
+    ];
+    let result = solver(settings)
+        .solve_from_state_with_condition_and_incumbent(root, Condition::Sturdy, &incumbent)
+        .expect("a terminal quality-bound branch must not become an internal solver error");
+
+    let mut state = root;
+    let mut condition = Condition::Sturdy;
+    for action in result {
+        state = state.use_action(action, condition, &settings).unwrap();
+        if action.increases_step_count() {
+            condition = condition.deterministic_successor();
+        }
+    }
+    assert!(state.is_final(&settings));
+    assert!(state.quality >= 12615);
+}
+
+#[test]
+fn finish_oracle_cannot_discard_a_valid_specialist_incumbent() {
+    let settings = Settings {
+        max_cp: 630,
+        max_durability: 60,
+        max_progress: 8500,
+        max_quality: 19500,
+        base_progress: 290,
+        base_quality: 301,
+        job_level: 100,
+        allowed_actions: ActionMask::all()
+            .remove(Action::TrainedEye)
+            .remove(Action::RapidSynthesis)
+            .remove(Action::HastyTouch)
+            .remove(Action::DaringTouch),
+        adversarial: false,
+        backload_progress: false,
+        stellar_steady_hand_charges: 0,
+    };
+    let root = SimulationState {
+        cp: 9,
+        durability: 5,
+        progress: 6785,
+        quality: 13405,
+        effects: SimulationState::new(&settings)
+            .effects
+            .with_veneration(1)
+            .with_heart_and_soul_active(true),
+        ..SimulationState::new(&settings)
+    };
+    let incumbent = [Action::IntensiveSynthesis];
+    let result = solver(settings)
+        .solve_from_state_with_condition_and_incumbent(root, Condition::Normal, &incumbent)
+        .expect("a validated incumbent must outrank an optimistic finish-oracle rejection");
+
+    assert_eq!(result, incumbent);
+    let final_state = root
+        .use_action(result[0], Condition::Normal, &settings)
+        .unwrap();
+    assert!(final_state.is_final(&settings));
+}

@@ -225,9 +225,11 @@ fn validate(request: &SolveRequest) -> Result<(), String> {
     if request.rewards.is_empty() || request.rewards.iter().any(|tier| tier.threshold == 0) {
         return Err(String::from("missing reward tiers"));
     }
-    if request.rewards.windows(2).any(|tiers| {
-        tiers[0].threshold >= tiers[1].threshold || tiers[0].scrip > tiers[1].scrip
-    }) {
+    if request
+        .rewards
+        .windows(2)
+        .any(|tiers| tiers[0].threshold >= tiers[1].threshold || tiers[0].scrip > tiers[1].scrip)
+    {
         return Err(String::from("reward tiers are not strictly ordered"));
     }
     let mechanics = request.mechanics;
@@ -248,14 +250,21 @@ fn validate(request: &SolveRequest) -> Result<(), String> {
     }
     if request.actions.brazen
         && (request.actions.brazen_gains.is_empty()
-            || request.actions.brazen_gains.iter().all(|gain| gain.weight == 0))
+            || request
+                .actions
+                .brazen_gains
+                .iter()
+                .all(|gain| gain.weight == 0))
     {
         return Err(String::from("missing Brazen Appraisal distribution"));
     }
     Ok(())
 }
 
-fn legacy_decision(request: &SolveRequest, fallback_reason: Option<String>) -> Result<Decision, String> {
+fn legacy_decision(
+    request: &SolveRequest,
+    fallback_reason: Option<String>,
+) -> Result<Decision, String> {
     let state = request.state;
     let actions = &request.actions;
     let legacy = &request.legacy;
@@ -280,9 +289,8 @@ fn legacy_decision(request: &SolveRequest, fallback_reason: Option<String>) -> R
         return legacy_result(GatheringAction::Collect, fallback_reason);
     }
 
-    let scrutiny_available = actions.scrutiny
-        && !state.scrutiny
-        && state.gp >= actions.scrutiny_cost;
+    let scrutiny_available =
+        actions.scrutiny && !state.scrutiny && state.gp >= actions.scrutiny_cost;
     let scour_available = actions.scour;
     let meticulous_available = actions.meticulous;
     let brazen_available = actions.brazen;
@@ -326,7 +334,10 @@ fn legacy_decision(request: &SolveRequest, fallback_reason: Option<String>) -> R
     Err(String::from("no legal collectable action"))
 }
 
-fn legacy_result(action: GatheringAction, fallback_reason: Option<String>) -> Result<Decision, String> {
+fn legacy_result(
+    action: GatheringAction,
+    fallback_reason: Option<String>,
+) -> Result<Decision, String> {
     Ok(Decision {
         action,
         solver_used: SolverMode::Legacy,
@@ -413,16 +424,39 @@ impl<'a> ExpectedSolver<'a> {
             GatheringAction::Collect if self.reward(state.collectability) > 0 => {
                 Some(self.collect_outcomes(state))
             }
-            GatheringAction::Scour if self.request.actions.scour && self.appraisal_useful(state) => {
-                Some(self.appraisal_outcomes(state, [(self.request.actions.scour_gain, 1.0)], false))
+            GatheringAction::Scour
+                if self.request.actions.scour && self.appraisal_useful(state) =>
+            {
+                Some(self.appraisal_outcomes(
+                    state,
+                    [(self.request.actions.scour_gain, 1.0)],
+                    false,
+                ))
             }
-            GatheringAction::Brazen if self.request.actions.brazen && self.appraisal_useful(state) => {
+            GatheringAction::Brazen
+                if self.request.actions.brazen && self.appraisal_useful(state) =>
+            {
                 let gains = if state.standard == 2 {
-                    let maximum = self.request.actions.brazen_gains.iter().map(|gain| gain.gain).max()?;
+                    let maximum = self
+                        .request
+                        .actions
+                        .brazen_gains
+                        .iter()
+                        .map(|gain| gain.gain)
+                        .max()?;
                     vec![(maximum, 1.0)]
                 } else {
-                    let total: u32 = self.request.actions.brazen_gains.iter().map(|gain| u32::from(gain.weight)).sum();
-                    self.request.actions.brazen_gains.iter()
+                    let total: u32 = self
+                        .request
+                        .actions
+                        .brazen_gains
+                        .iter()
+                        .map(|gain| u32::from(gain.weight))
+                        .sum();
+                    self.request
+                        .actions
+                        .brazen_gains
+                        .iter()
                         .filter(|gain| gain.weight > 0)
                         .map(|gain| {
                             let effective_gain = if state.standard == 1 {
@@ -436,9 +470,14 @@ impl<'a> ExpectedSolver<'a> {
                 };
                 Some(self.appraisal_outcomes(state, gains, false))
             }
-            GatheringAction::Meticulous if self.request.actions.meticulous && self.appraisal_useful(state) => {
+            GatheringAction::Meticulous
+                if self.request.actions.meticulous && self.appraisal_useful(state) =>
+            {
                 let gain = if state.standard > 0 {
-                    self.request.actions.meticulous_gain.max(self.request.actions.scour_gain)
+                    self.request
+                        .actions
+                        .meticulous_gain
+                        .max(self.request.actions.scour_gain)
                 } else {
                     self.request.actions.meticulous_gain
                 };
@@ -528,8 +567,7 @@ impl<'a> ExpectedSolver<'a> {
             1
         };
         let preserve_bp = if meticulous {
-            ((u32::from(mechanics.meticulous_preserve_bp) * multiplier)
-                + u32::from(standard_bonus))
+            ((u32::from(mechanics.meticulous_preserve_bp) * multiplier) + u32::from(standard_bonus))
                 .min(10_000) as u16
         } else {
             0
@@ -544,7 +582,9 @@ impl<'a> ExpectedSolver<'a> {
             };
             for (preserve_probability, preserved) in probability_branches(preserve_bp) {
                 for (intuition_probability, intuition) in probability_branches(intuition_bp) {
-                    for (standard_probability, standard_proc) in probability_branches(mechanics.standard_proc_bp) {
+                    for (standard_probability, standard_proc) in
+                        probability_branches(mechanics.standard_proc_bp)
+                    {
                         let high_branches = if standard_proc {
                             probability_branches(mechanics.high_standard_upgrade_bp)
                         } else {
@@ -552,8 +592,13 @@ impl<'a> ExpectedSolver<'a> {
                         };
                         for (high_probability, high_standard) in high_branches {
                             let mut next = state;
-                            let intuition_gain = if intuition { mechanics.intuition_gain } else { 0 };
-                            next.collectability = next.collectability
+                            let intuition_gain = if intuition {
+                                mechanics.intuition_gain
+                            } else {
+                                0
+                            };
+                            next.collectability = next
+                                .collectability
                                 .saturating_add(gain)
                                 .saturating_add(intuition_gain)
                                 .min(1000);
@@ -563,10 +608,19 @@ impl<'a> ExpectedSolver<'a> {
                             next.scrutiny = false;
                             next.collectors_focus = false;
                             next.priming_touch = false;
-                            next.standard = if high_standard { 2 } else if standard_proc { 1 } else { 0 };
+                            next.standard = if high_standard {
+                                2
+                            } else if standard_proc {
+                                1
+                            } else {
+                                0
+                            };
                             outcomes.push((
-                                gain_probability * preserve_probability * intuition_probability
-                                    * standard_probability * high_probability,
+                                gain_probability
+                                    * preserve_probability
+                                    * intuition_probability
+                                    * standard_probability
+                                    * high_probability,
                                 next,
                                 0.0,
                             ));
@@ -582,13 +636,19 @@ impl<'a> ExpectedSolver<'a> {
         let success_probability = probability(self.request.mechanics.gather_success_bp);
         let reward = f64::from(self.reward(state.collectability));
         let mut outcomes = Vec::new();
-        for (gather_probability, success) in [(success_probability, true), (1.0 - success_probability, false)] {
+        for (gather_probability, success) in [
+            (success_probability, true),
+            (1.0 - success_probability, false),
+        ] {
             if gather_probability == 0.0 {
                 continue;
             }
             let mut next = state;
             next.integrity -= 1;
-            next.gp = next.gp.saturating_add(self.request.mechanics.collect_gp_regen).min(next.max_gp);
+            next.gp = next
+                .gp
+                .saturating_add(self.request.mechanics.collect_gp_regen)
+                .min(next.max_gp);
             if success {
                 next.remaining = next.remaining.saturating_sub(1);
                 next.collectability = 0;
@@ -611,8 +671,16 @@ impl<'a> ExpectedSolver<'a> {
                     revisited.priming_touch = false;
                     revisited.standard = 0;
                     revisited.eureka = false;
-                    outcomes.push((gather_probability * revisit_probability, revisited, if success { reward } else { 0.0 }));
-                    outcomes.push((gather_probability * (1.0 - revisit_probability), next, if success { reward } else { 0.0 }));
+                    outcomes.push((
+                        gather_probability * revisit_probability,
+                        revisited,
+                        if success { reward } else { 0.0 },
+                    ));
+                    outcomes.push((
+                        gather_probability * (1.0 - revisit_probability),
+                        next,
+                        if success { reward } else { 0.0 },
+                    ));
                     continue;
                 }
             }
@@ -622,14 +690,19 @@ impl<'a> ExpectedSolver<'a> {
     }
 
     fn reward(&self, collectability: u16) -> u16 {
-        self.request.rewards.iter()
+        self.request
+            .rewards
+            .iter()
             .rev()
             .find(|tier| collectability >= tier.threshold)
             .map_or(0, |tier| tier.scrip)
     }
 
     fn appraisal_useful(&self, state: State) -> bool {
-        self.request.rewards.last().is_some_and(|tier| state.collectability < tier.threshold)
+        self.request
+            .rewards
+            .last()
+            .is_some_and(|tier| state.collectability < tier.threshold)
     }
 }
 
@@ -659,7 +732,10 @@ fn compare_candidates(
 }
 
 fn action_rank(action: GatheringAction) -> usize {
-    ACTION_ORDER.iter().position(|candidate| *candidate == action).unwrap()
+    ACTION_ORDER
+        .iter()
+        .position(|candidate| *candidate == action)
+        .unwrap()
 }
 
 fn probability(bp: u16) -> f64 {
@@ -687,7 +763,8 @@ fn merge_outcomes(outcomes: Vec<(f64, State, f64)>) -> Vec<(f64, State, f64)> {
     for (probability, state, reward) in outcomes {
         *merged.entry((state, reward.to_bits())).or_default() += probability;
     }
-    merged.into_iter()
+    merged
+        .into_iter()
         .map(|((state, reward), probability)| (probability, state, f64::from_bits(reward)))
         .collect()
 }
@@ -711,7 +788,10 @@ mod tests {
             actions: ActionModel {
                 scour_gain: 500,
                 meticulous_gain: 100,
-                brazen_gains: vec![WeightedGain { gain: 100, weight: 1 }],
+                brazen_gains: vec![WeightedGain {
+                    gain: 100,
+                    weight: 1,
+                }],
                 scrutiny_cost: 200,
                 focus_cost: 100,
                 priming_cost: 400,
@@ -755,9 +835,16 @@ mod tests {
     #[test]
     fn two_lower_tier_collects_beat_one_high_tier_collect() {
         let decision = solve(&request(vec![
-            RewardTier { threshold: 500, scrip: 60 },
-            RewardTier { threshold: 1000, scrip: 100 },
-        ])).unwrap();
+            RewardTier {
+                threshold: 500,
+                scrip: 60,
+            },
+            RewardTier {
+                threshold: 1000,
+                scrip: 100,
+            },
+        ]))
+        .unwrap();
         assert_eq!(decision.action, GatheringAction::Scour);
         assert!((decision.expected_scrip - 120.0).abs() < 1e-9);
     }
@@ -765,16 +852,26 @@ mod tests {
     #[test]
     fn high_payout_can_justify_consuming_both_integrity() {
         let decision = solve(&request(vec![
-            RewardTier { threshold: 500, scrip: 40 },
-            RewardTier { threshold: 1000, scrip: 100 },
-        ])).unwrap();
+            RewardTier {
+                threshold: 500,
+                scrip: 40,
+            },
+            RewardTier {
+                threshold: 1000,
+                scrip: 100,
+            },
+        ]))
+        .unwrap();
         assert_eq!(decision.action, GatheringAction::Scour);
         assert!((decision.expected_scrip - 100.0).abs() < 1e-9);
     }
 
     #[test]
     fn exact_preservation_probability_changes_expected_yield() {
-        let mut input = request(vec![RewardTier { threshold: 100, scrip: 10 }]);
+        let mut input = request(vec![RewardTier {
+            threshold: 100,
+            scrip: 10,
+        }]);
         input.actions.scour = false;
         input.actions.meticulous = true;
         input.mechanics.meticulous_preserve_bp = 5_000;
@@ -783,13 +880,20 @@ mod tests {
         input.mechanics.meticulous_preserve_bp = 0;
         let without_preservation = solve(&input).unwrap();
         assert_eq!(decision.action, GatheringAction::Meticulous);
-        assert!(decision.expected_scrip > without_preservation.expected_scrip,
-            "with={} without={}", decision.expected_scrip, without_preservation.expected_scrip);
+        assert!(
+            decision.expected_scrip > without_preservation.expected_scrip,
+            "with={} without={}",
+            decision.expected_scrip,
+            without_preservation.expected_scrip
+        );
     }
 
     #[test]
     fn unsupported_reward_model_falls_back_to_rust_legacy() {
-        let mut input = request(vec![RewardTier { threshold: 500, scrip: 60 }]);
+        let mut input = request(vec![RewardTier {
+            threshold: 500,
+            scrip: 60,
+        }]);
         input.unsupported_reason = Some(String::from("custom delivery"));
         let decision = solve(&input).unwrap();
         assert_eq!(decision.solver_used, SolverMode::Legacy);

@@ -49,6 +49,7 @@ pub struct QualityUbSolverShard<'main> {
     context: &'main QualityUbSolverContext,
     templates: &'main FxHashMap<TemplateData, TemplateRecord>,
     local_states: SolvedStates,
+    query_states: FxHashMap<(ReducedState, u16), u16>,
 }
 
 impl QualityUbSolver {
@@ -104,6 +105,7 @@ impl QualityUbSolver {
             context: &self.context,
             templates: &self.templates,
             local_states: SolvedStates::default(),
+            query_states: FxHashMap::default(),
         }
     }
 
@@ -111,17 +113,48 @@ impl QualityUbSolver {
         let mut templates = rustc_hash::FxHashMap::<TemplateData, u16>::default();
         let mut heap = std::collections::BinaryHeap::<Template>::default();
 
-        let seed_template = {
-            let seed_effects = Effects::initial(&self.context.settings.simulator_settings)
-                .with_special_quality_state(SpecialQualityState::Normal)
-                .with_trained_perfection_available(false)
-                .with_combo(Combo::None);
-            Template::new(
+        let base_effects = Effects::initial(&self.context.settings.simulator_settings)
+            .with_special_quality_state(SpecialQualityState::Normal)
+            .with_trained_perfection_available(false)
+            .with_combo(Combo::None);
+        let heart_and_soul_allowed = self
+            .context
+            .settings
+            .simulator_settings
+            .is_action_allowed::<HeartAndSoul>();
+        let quick_innovation_allowed = self
+            .context
+            .settings
+            .simulator_settings
+            .is_action_allowed::<QuickInnovation>();
+        let mut specialist_roots = vec![(0, false, false, false)];
+        if heart_and_soul_allowed {
+            specialist_roots.extend([(0, false, false, true), (1, true, false, false)]);
+        }
+        if quick_innovation_allowed {
+            specialist_roots.push((1, false, true, false));
+        }
+        if heart_and_soul_allowed && quick_innovation_allowed {
+            specialist_roots.extend([
+                (1, false, true, true),
+                (1, true, true, false),
+                (2, true, true, false),
+            ]);
+        }
+        for (delineations, heart_and_soul, quick_innovation, heart_and_soul_active) in
+            specialist_roots
+        {
+            let seed_effects = base_effects
+                .with_crafter_delineations(delineations)
+                .with_heart_and_soul_available(heart_and_soul)
+                .with_quick_innovation_available(quick_innovation)
+                .with_heart_and_soul_active(heart_and_soul_active)
+                .canonicalize_specialist_resources();
+            heap.push(Template::new(
                 self.context.settings.max_cp(),
                 TemplateData::new(seed_effects, 0),
-            )
-        };
-        heap.push(seed_template);
+            ));
+        }
 
         while let Some(template) = heap.pop() {
             let entry = templates.entry(template.data).or_default();
@@ -166,7 +199,21 @@ impl QualityUbSolver {
     }
 
     fn lookup_slot(&self, state: &ReducedState) -> Option<&[ParetoValue]> {
-        lookup_slot(&self.templates, self.min_solved_cp(), state)
+        lookup_slot(&self.templates, self.min_solved_cp(), state).or_else(|| {
+            let data = TemplateData::new(state.effects, state.compressed_unreliable_quality);
+            let required_cp = self.templates.get(&data)?.required_cp_for_max?;
+            if state.cp <= required_cp {
+                return None;
+            }
+            lookup_slot(
+                &self.templates,
+                self.min_solved_cp(),
+                &ReducedState {
+                    cp: required_cp,
+                    ..*state
+                },
+            )
+        })
     }
 
     pub fn precompute(&mut self) -> Result<(), SolverException> {
@@ -193,82 +240,99 @@ impl QualityUbSolver {
         // This is the reason why states with HeartAndSoul and QuickInnovation available must be computed separately.
         // HeartAndSoul enables the use of TricksOfTrade, which restores CP.
         // QuickInnovation requires no CP (and no durability, so durability cost in terms of CP is 0).
-        for (heart_and_soul, quick_innovation) in
-            [(false, false), (false, true), (true, false), (true, true)]
-        {
-            for stellar_steady_hand in 0..3 {
-                let mut templates: Vec<_> = all_templates
-                    .iter()
-                    .filter(|template| {
-                        template.data.effects.heart_and_soul_available() == heart_and_soul
-                            && template.data.effects.quick_innovation_available()
-                                == quick_innovation
-                            && template.data.effects.stellar_steady_hand_charges()
-                                == stellar_steady_hand
-                    })
-                    .copied()
-                    .collect();
-                // 2 * durability_cost is the minimum CP a state must have to not be considered "final".
-                // See `ReducedState::is_final` for details.
-                for cp in (min_solved_cp..=self.context.settings.max_cp()).step_by(2) {
-                    if self.context.interrupt_signal.is_set() {
-                        return Err(SolverException::Interrupted);
-                    }
-                    let solved_states = templates
-                        .par_iter_mut()
-                        .filter_map(|template| {
-                            template.instantiate(cp).map(|state| (template, state))
-                        })
-                        .map_init(
-                            ParetoFrontBuilder::new,
-                            |pf_builder, (template, state)| -> Result<_, SolverException> {
-                                let pareto_front =
-                                    self.solve_precompute_state(pf_builder, state)?;
-                                let template_is_maximal = {
-                                    // A template is "maximal" if there is no benefit of solving it with higher CP
-                                    let required_progress = self.context.settings.max_progress();
-                                    let required_quality =
-                                        self.context.settings.max_quality().saturating_sub(
-                                            self.context.iq_quality_lut
-                                                [usize::from(state.effects.inner_quiet())],
-                                        );
-                                    pareto_front[0].progress >= required_progress
-                                        && pareto_front[0].quality >= required_quality
-                                };
-                                if template_is_maximal {
-                                    template.required_cp_for_max_progress_and_quality = Some(cp);
+        for delineations in 0..=2 {
+            for (heart_and_soul, quick_innovation) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                for heart_and_soul_active in [false, true] {
+                    for stellar_steady_hand in 0..3 {
+                        let mut templates: Vec<_> = all_templates
+                            .iter()
+                            .filter(|template| {
+                                template.data.effects.heart_and_soul_available() == heart_and_soul
+                                    && template.data.effects.quick_innovation_available()
+                                        == quick_innovation
+                                    && template.data.effects.crafter_delineations() == delineations
+                                    && template.data.effects.heart_and_soul_active()
+                                        == heart_and_soul_active
+                                    && template.data.effects.stellar_steady_hand_charges()
+                                        == stellar_steady_hand
+                            })
+                            .copied()
+                            .collect();
+                        // 2 * durability_cost is the minimum CP a state must have to not be considered "final".
+                        // See `ReducedState::is_final` for details.
+                        for cp in (min_solved_cp..=self.context.settings.max_cp()).step_by(2) {
+                            if self.context.interrupt_signal.is_set() {
+                                return Err(SolverException::Interrupted);
+                            }
+                            let solved_states = templates
+                                .par_iter_mut()
+                                .filter_map(|template| {
+                                    template.instantiate(cp).map(|state| (template, state))
+                                })
+                                .map_init(
+                                    ParetoFrontBuilder::new,
+                                    |pf_builder, (template, state)| -> Result<_, SolverException> {
+                                        let pareto_front =
+                                            self.solve_precompute_state(pf_builder, state)?;
+                                        let template_is_maximal = {
+                                            // A template is "maximal" if there is no benefit of solving it with higher CP
+                                            let required_progress =
+                                                self.context.settings.max_progress();
+                                            let required_quality =
+                                                self.context.settings.max_quality().saturating_sub(
+                                                    self.context.iq_quality_lut
+                                                        [usize::from(state.effects.inner_quiet())],
+                                                );
+                                            pareto_front[0].progress >= required_progress
+                                                && pareto_front[0].quality >= required_quality
+                                        };
+                                        if template_is_maximal {
+                                            template.required_cp_for_max_progress_and_quality =
+                                                Some(cp);
+                                        }
+                                        Ok((template.data, pareto_front))
+                                    },
+                                )
+                                .collect::<Result<Vec<_>, SolverException>>()?;
+                            self.stats.states_on_main += solved_states.len();
+                            for (template_data, pareto_front) in solved_states {
+                                if pareto_front.is_empty() {
+                                    return Err(internal_error!(
+                                        "QualityUbSolver::precompute produced empty Pareto front.",
+                                        self.context.settings
+                                    ));
                                 }
-                                Ok((template.data, pareto_front))
-                            },
-                        )
-                        .collect::<Result<Vec<_>, SolverException>>()?;
-                    self.stats.states_on_main += solved_states.len();
-                    for (template_data, pareto_front) in solved_states {
-                        if pareto_front.is_empty() {
-                            return Err(internal_error!(
-                                "QualityUbSolver::precompute produced empty Pareto front.",
-                                self.context.settings
-                            ));
+                                let pareto_len = pareto_front.len();
+                                let length_checked = pareto_front.into_boxed_slice();
+                                let slots =
+                                    &mut self.templates.get_mut(&template_data).unwrap().slots;
+                                let index = usize::from((cp - min_solved_cp) / 2);
+                                slots[index] = Some(length_checked);
+                                self.stats.values += pareto_len;
+                            }
                         }
-                        let pareto_len = pareto_front.len();
-                        let length_checked = pareto_front.into_boxed_slice();
-                        let slots = &mut self.templates.get_mut(&template_data).unwrap().slots;
-                        let index = usize::from((cp - min_solved_cp) / 2);
-                        slots[index] = Some(length_checked);
-                        self.stats.values += pareto_len;
-                    }
-                }
-                for template in templates {
-                    if let Some(required_cp) = template.required_cp_for_max_progress_and_quality {
-                        self.templates
-                            .get_mut(&template.data)
-                            .unwrap()
-                            .required_cp_for_max = Some(required_cp);
+                        for template in templates {
+                            if let Some(required_cp) =
+                                template.required_cp_for_max_progress_and_quality
+                            {
+                                self.templates
+                                    .get_mut(&template.data)
+                                    .unwrap()
+                                    .required_cp_for_max = Some(required_cp);
+                            }
+                        }
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn discard_precompute(&mut self) {
+        self.templates.clear();
+        self.stats = QualityUbSolverStats::default();
     }
 
     fn solve_precompute_state(
@@ -356,7 +420,22 @@ impl QualityUbSolverShard<'_> {
     }
 
     fn lookup_shared(&self, state: &ReducedState) -> Option<&[ParetoValue]> {
-        lookup_slot(self.templates, 2 * self.context.durability_cost, state)
+        let min_solved_cp = 2 * self.context.durability_cost;
+        lookup_slot(self.templates, min_solved_cp, state).or_else(|| {
+            let data = TemplateData::new(state.effects, state.compressed_unreliable_quality);
+            let required_cp = self.templates.get(&data)?.required_cp_for_max?;
+            if state.cp <= required_cp {
+                return None;
+            }
+            lookup_slot(
+                self.templates,
+                min_solved_cp,
+                &ReducedState {
+                    cp: required_cp,
+                    ..*state
+                },
+            )
+        })
     }
 
     pub fn quality_upper_bound(
@@ -373,6 +452,13 @@ impl QualityUbSolverShard<'_> {
 
         let reduced_state =
             ReducedState::from_state(state, &self.context.settings, self.context.durability_cost);
+        if reduced_state.is_final(self.context.durability_cost) {
+            return Ok(if required_progress == 0 {
+                state.quality.min(self.context.settings.max_quality())
+            } else {
+                0
+            });
+        }
 
         let template_data = TemplateData::new(
             reduced_state.effects,
@@ -420,6 +506,76 @@ impl QualityUbSolverShard<'_> {
             .get(i)
             .map_or(0, |value| state.quality.saturating_add(value.quality));
         Ok(std::cmp::min(self.context.settings.max_quality(), quality))
+    }
+
+    /// Query only the progress requirement needed by this root instead of materializing its
+    /// complete progress/quality Pareto frontier. Shared precomputed frontiers remain the fast
+    /// path; arbitrary live-root states use exact memoized dynamic programming.
+    pub fn quality_upper_bound_for_progress(
+        &mut self,
+        mut state: SimulationState,
+    ) -> Result<u16, SolverException> {
+        let mut required_progress = self.context.settings.max_progress() - state.progress;
+        if state.effects.muscle_memory() != 0 {
+            required_progress =
+                required_progress.saturating_sub(self.context.largest_progress_increase);
+            state.effects.set_muscle_memory(0);
+        }
+        let root_quality = state.quality;
+        let reduced_state =
+            ReducedState::from_state(state, &self.context.settings, self.context.durability_cost);
+        let Some(additional) = self.query_quality(reduced_state, required_progress)? else {
+            return Ok(0);
+        };
+        Ok(root_quality
+            .saturating_add(additional)
+            .min(self.context.settings.max_quality()))
+    }
+
+    fn query_quality(
+        &mut self,
+        state: ReducedState,
+        required_progress: u16,
+    ) -> Result<Option<u16>, SolverException> {
+        if self.context.interrupt_signal.is_set() {
+            return Err(SolverException::Interrupted);
+        }
+        if let Some(front) = self.lookup_shared(&state) {
+            let index = front.partition_point(|value| value.progress < required_progress);
+            return Ok(front.get(index).map(|value| value.quality));
+        }
+        let key = (state, required_progress);
+        if let Some(&quality) = self.query_states.get(&key) {
+            return Ok(Some(quality));
+        }
+
+        let mut best = None;
+        for action in FULL_SEARCH_ACTIONS {
+            let Some((child_state, progress, quality)) = state.use_action(
+                action,
+                &self.context.settings,
+                self.context.durability_cost,
+                self.context.largest_progress_increase,
+            ) else {
+                continue;
+            };
+            let candidate = if progress >= required_progress {
+                Some(quality)
+            } else if child_state.is_final(self.context.durability_cost) {
+                continue;
+            } else {
+                self.query_quality(child_state, required_progress - progress)?
+                    .map(|child_quality| quality.saturating_add(child_quality))
+            };
+            best = best.max(candidate);
+            if best == Some(self.context.settings.max_quality()) {
+                break;
+            }
+        }
+        if let Some(best) = best {
+            self.query_states.insert(key, best);
+        }
+        Ok(best)
     }
 
     fn solve_state(&mut self, state: ReducedState) -> Result<(), SolverException> {

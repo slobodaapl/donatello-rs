@@ -33,7 +33,11 @@ impl From<&SimulationState> for Key {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Value(wide::u32x4);
+struct Value {
+    state: wide::u32x4,
+    steps: u8,
+    duration: u8,
+}
 
 impl Value {
     /// Guard value for Pareto-dominance check.
@@ -54,23 +58,29 @@ impl Value {
 
     /// `A` dominates `B` if every member of `A` is geq the corresponding member in `B`.
     fn dominates(&self, other: &Self) -> bool {
-        let guarded_value = Self::GUARD | self.0;
-        (guarded_value - other.0) & Self::GUARD == Self::GUARD
+        let guarded_value = Self::GUARD | self.state;
+        (guarded_value - other.state) & Self::GUARD == Self::GUARD
+            && self.steps <= other.steps
+            && self.duration <= other.duration
     }
 
     fn cp(&self) -> u16 {
-        (self.0.as_array()[0] >> 16) as u16
+        (self.state.as_array()[0] >> 16) as u16
     }
 }
 
-impl From<&SimulationState> for Value {
-    fn from(state: &SimulationState) -> Self {
-        Self(wide::u32x4::new([
-            (u32::from(state.cp) << 16) + u32::from(state.durability),
-            u32::from(state.quality),
-            u32::from(state.quality) + u32::from(state.unreliable_quality),
-            (state.effects.into_bits() & EFFECTS_VALUE_MASK) as u32,
-        ]))
+impl Value {
+    fn new(state: &SimulationState, steps: u8, duration: u8) -> Self {
+        Self {
+            state: wide::u32x4::new([
+                (u32::from(state.cp) << 16) + u32::from(state.durability),
+                u32::from(state.quality),
+                u32::from(state.quality) + u32::from(state.unreliable_quality),
+                (state.effects.into_bits() & EFFECTS_VALUE_MASK) as u32,
+            ]),
+            steps,
+            duration,
+        }
     }
 }
 
@@ -113,6 +123,8 @@ impl ParetoFront {
         &mut self,
         mut elements: Vec<T>,
         to_state: impl Fn(&T) -> &SimulationState + Sync,
+        steps: u8,
+        duration: u8,
     ) -> impl Iterator<Item = T> {
         // Group elements by their key to avoid contention in the hashmap.
         let elements_by_key: Vec<(Key, &[T])> = {
@@ -153,19 +165,21 @@ impl ParetoFront {
                         + u64::from(state.quality)
                         + u64::from(state.unreliable_quality)
                         + state.effects.into_bits();
-                    std::cmp::Reverse(weight)
+                    (std::cmp::Reverse(weight), steps, duration)
                 });
                 let mut root_node = self.buckets.get(&key).unwrap().lock().unwrap();
-                elements.retain(|element| Self::insert(to_state(element), &mut root_node));
+                elements.retain(|element| {
+                    Self::insert(to_state(element), steps, duration, &mut root_node)
+                });
                 elements
             })
             .collect::<Vec<_>>();
         non_dominated_elements.into_iter().flatten()
     }
 
-    fn insert(state: &SimulationState, mut node: &mut TreeNode) -> bool {
+    fn insert(state: &SimulationState, steps: u8, duration: u8, mut node: &mut TreeNode) -> bool {
         const MAX_LEAF_SIZE: usize = 200;
-        let new_value = Value::from(state);
+        let new_value = Value::new(state, steps, duration);
         while let TreeNode::Intermediate(intermediate) = node {
             if new_value.cp() < intermediate.partition_point {
                 node = intermediate.lhs.as_mut();

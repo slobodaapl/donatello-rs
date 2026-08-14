@@ -1099,6 +1099,7 @@ dependencies = [
  "gathering-solvers",
  "raphael-sim",
  "raphael-solver",
+ "rayon",
  "serde",
  "serde_json",
 ]

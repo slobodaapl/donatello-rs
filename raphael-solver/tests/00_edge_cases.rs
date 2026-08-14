@@ -137,8 +137,8 @@ fn zero_quality() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 64,
-                processed_nodes: 42,
+                inserted_nodes: 52,
+                processed_nodes: 43,
             },
             finish_solver_stats: FinishSolverStats {
                 states: 4659,
@@ -146,8 +146,8 @@ fn zero_quality() {
             },
             quality_ub_stats: QualityUbSolverStats {
                 states_on_main: 31147,
-                states_on_shards: 4301,
-                values: 120278,
+                states_on_shards: 0,
+                values: 109398,
             },
             step_lb_stats: StepLbSolverStats {
                 states_on_main: 0,
@@ -192,7 +192,7 @@ fn max_quality() {
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
                 inserted_nodes: 97351,
-                processed_nodes: 6915,
+                processed_nodes: 6916,
             },
             finish_solver_stats: FinishSolverStats {
                 states: 4659,
@@ -200,8 +200,8 @@ fn max_quality() {
             },
             quality_ub_stats: QualityUbSolverStats {
                 states_on_main: 389796,
-                states_on_shards: 517,
-                values: 2236383,
+                states_on_shards: 513,
+                values: 2236379,
             },
             step_lb_stats: StepLbSolverStats {
                 states_on_main: 26538,
@@ -246,21 +246,21 @@ fn large_progress_quality_increase() {
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
                 inserted_nodes: 79,
-                processed_nodes: 18,
+                processed_nodes: 19,
             },
             finish_solver_stats: FinishSolverStats {
-                states: 27451,
-                values: 37675,
+                states: 28235,
+                values: 38643,
             },
             quality_ub_stats: QualityUbSolverStats {
-                states_on_main: 2208900,
-                states_on_shards: 26,
-                values: 8280020,
+                states_on_main: 3819462,
+                states_on_shards: 6,
+                values: 14401500,
             },
             step_lb_stats: StepLbSolverStats {
-                states_on_main: 419,
-                states_on_shards: 8322,
-                values: 34247,
+                states_on_main: 300,
+                states_on_shards: 3138,
+                values: 14198,
             },
         }
     "#]];
@@ -300,7 +300,7 @@ fn backload_progress_single_delicate_synthesis() {
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
                 inserted_nodes: 1,
-                processed_nodes: 1,
+                processed_nodes: 2,
             },
             finish_solver_stats: FinishSolverStats {
                 states: 3478,
@@ -308,8 +308,8 @@ fn backload_progress_single_delicate_synthesis() {
             },
             quality_ub_stats: QualityUbSolverStats {
                 states_on_main: 3243,
-                states_on_shards: 3,
-                values: 3246,
+                states_on_shards: 0,
+                values: 3243,
             },
             step_lb_stats: StepLbSolverStats {
                 states_on_main: 1,
@@ -354,8 +354,8 @@ fn issue_216_steplbsolver_crash() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 436375,
-                processed_nodes: 21747,
+                inserted_nodes: 436416,
+                processed_nodes: 21750,
             },
             finish_solver_stats: FinishSolverStats {
                 states: 9851,
@@ -363,8 +363,8 @@ fn issue_216_steplbsolver_crash() {
             },
             quality_ub_stats: QualityUbSolverStats {
                 states_on_main: 318520,
-                states_on_shards: 6,
-                values: 1267769,
+                states_on_shards: 0,
+                values: 1267763,
             },
             step_lb_stats: StepLbSolverStats {
                 states_on_main: 36739,
@@ -410,7 +410,7 @@ fn issue_312_quick_innovation_reflect() {
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
                 inserted_nodes: 17,
-                processed_nodes: 4,
+                processed_nodes: 5,
             },
             finish_solver_stats: FinishSolverStats {
                 states: 10142,
@@ -418,13 +418,13 @@ fn issue_312_quick_innovation_reflect() {
             },
             quality_ub_stats: QualityUbSolverStats {
                 states_on_main: 28849,
-                states_on_shards: 2,
-                values: 33548,
+                states_on_shards: 1,
+                values: 33547,
             },
             step_lb_stats: StepLbSolverStats {
-                states_on_main: 60,
-                states_on_shards: 170,
-                values: 368,
+                states_on_main: 46,
+                states_on_shards: 75,
+                values: 194,
             },
         }
     "#]];
@@ -450,7 +450,7 @@ fn daring_touch_interrupted_combo() {
     let simulator_settings = Settings {
         max_cp: 0,
         max_durability: 30,
-        max_progress: 500,
+        max_progress: 100,
         max_quality: 347,
         base_progress: 100,
         base_quality: 100,
@@ -477,22 +477,22 @@ fn daring_touch_interrupted_combo() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 28,
-                processed_nodes: 10,
+                inserted_nodes: 37,
+                processed_nodes: 26,
             },
             finish_solver_stats: FinishSolverStats {
-                states: 24476,
-                values: 24476,
+                states: 20435,
+                values: 20435,
             },
             quality_ub_stats: QualityUbSolverStats {
-                states_on_main: 22201,
-                states_on_shards: 44,
-                values: 26324,
+                states_on_main: 18323,
+                states_on_shards: 39,
+                values: 18362,
             },
             step_lb_stats: StepLbSolverStats {
-                states_on_main: 528,
-                states_on_shards: 2680,
-                values: 8173,
+                states_on_main: 13,
+                states_on_shards: 176,
+                values: 189,
             },
         }
     "#]];
@@ -504,7 +504,7 @@ fn daring_touch_interrupted_combo() {
             Action::HastyTouch,
             Action::QuickInnovation,
             Action::DaringTouch,
-            Action::RapidSynthesis
+            Action::BasicSynthesis
         ]
     );
 }
@@ -542,8 +542,8 @@ fn low_level_steplbsolver_crash() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 3,
-                processed_nodes: 3,
+                inserted_nodes: 4,
+                processed_nodes: 6,
             },
             finish_solver_stats: FinishSolverStats {
                 states: 6,
@@ -551,8 +551,8 @@ fn low_level_steplbsolver_crash() {
             },
             quality_ub_stats: QualityUbSolverStats {
                 states_on_main: 556,
-                states_on_shards: 1,
-                values: 1278,
+                states_on_shards: 0,
+                values: 1276,
             },
             step_lb_stats: StepLbSolverStats {
                 states_on_main: 0,
@@ -595,7 +595,7 @@ fn solution_must_reach_target_quality() {
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
                 inserted_nodes: 3294,
-                processed_nodes: 2866,
+                processed_nodes: 2867,
             },
             finish_solver_stats: FinishSolverStats {
                 states: 7042,
@@ -603,8 +603,8 @@ fn solution_must_reach_target_quality() {
             },
             quality_ub_stats: QualityUbSolverStats {
                 states_on_main: 975933,
-                states_on_shards: 24437,
-                values: 21621882,
+                states_on_shards: 24436,
+                values: 21621881,
             },
             step_lb_stats: StepLbSolverStats {
                 states_on_main: 472838,

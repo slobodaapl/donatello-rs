@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-raphael-sim = { workspace = true }
+raphael-sim = { workspace = true, features = ["serde"] }
 raphael-solver = { workspace = true }
 raphael-data = { workspace = true }
 serde = { workspace = true }

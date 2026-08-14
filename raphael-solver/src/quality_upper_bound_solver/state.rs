@@ -69,6 +69,7 @@ impl ReducedState {
                 // Careful Observation is intentionally absent from deterministic search;
                 // its remaining charges therefore cannot affect this upper bound.
                 .with_careful_observation_charges(0)
+                .canonicalize_specialist_resources()
         };
         Some(Self {
             cp,

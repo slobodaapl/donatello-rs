@@ -13,8 +13,13 @@ use crate::quality_upper_bound_solver::{
 use crate::step_lower_bound_solver::{StepLbSolverShard, StepLbSolverStats, StepLbStates};
 use crate::utils::AtomicFlag;
 use crate::utils::ScopedTimer;
-use crate::{FinishSolver, QualityUbSolver, SolverException, SolverSettings, StepLbSolver};
+use crate::{
+    FinishSolver, ProgressFrontierSolver, ProgressPolicy, ProgressTarget, QualityUbSolver,
+    SolverException, SolverSettings, StepLbSolver,
+};
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::vec::Vec;
 use strum::IntoEnumIterator;
 
@@ -45,6 +50,15 @@ pub struct MacroSolverStats {
     pub step_lb_stats: StepLbSolverStats,
 }
 
+#[derive(Debug, Clone)]
+pub struct MacroSolveOutcome {
+    pub actions: Vec<Action>,
+    pub optimal: bool,
+    pub quality: u16,
+    pub quality_upper_bound: u16,
+    pub stats: MacroSolverStats,
+}
+
 pub struct MacroSolver<'a> {
     settings: SolverSettings,
     solution_callback: Box<SolutionCallback<'a>>,
@@ -54,6 +68,64 @@ pub struct MacroSolver<'a> {
     step_lb_solver: StepLbSolver,
     interrupt_signal: AtomicFlag,
     last_solve_runtime_stats: MacroSolverStats,
+    improved_solution_found: Arc<AtomicBool>,
+    complete_solution_found: Arc<AtomicBool>,
+    progress_frontier_cache: Option<ProgressFrontierCache>,
+}
+
+struct ProgressFrontierCache {
+    root: SimulationState,
+    condition: Condition,
+    completion: Option<Vec<Action>>,
+    one_short_prefixes: Vec<Vec<Action>>,
+    one_short_attempted: bool,
+}
+
+struct OneShortWorker {
+    interrupt: AtomicFlag,
+    handle: Option<std::thread::JoinHandle<Vec<Vec<Action>>>>,
+}
+
+impl OneShortWorker {
+    const EXPANSION_LIMIT: usize = 100;
+
+    fn start(settings: SolverSettings, root: SimulationState, condition: Condition) -> Self {
+        let interrupt = AtomicFlag::new();
+        let worker_interrupt = interrupt.clone();
+        let handle = std::thread::spawn(move || {
+            ProgressFrontierSolver::new(settings, worker_interrupt)
+                .solve_with_expansion_limit(
+                    root,
+                    condition,
+                    ProgressTarget::OneShort,
+                    ProgressPolicy::Pareto,
+                    Some(Self::EXPANSION_LIMIT),
+                )
+                .into_iter()
+                .map(|endpoint| endpoint.actions)
+                .collect()
+        });
+        Self {
+            interrupt,
+            handle: Some(handle),
+        }
+    }
+
+    fn finish(mut self) -> Vec<Vec<Action>> {
+        self.handle
+            .take()
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for OneShortWorker {
+    fn drop(&mut self) {
+        self.interrupt.set();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl<'a> MacroSolver<'a> {
@@ -74,6 +146,9 @@ impl<'a> MacroSolver<'a> {
             step_lb_solver,
             interrupt_signal,
             last_solve_runtime_stats: MacroSolverStats::default(),
+            improved_solution_found: Arc::new(AtomicBool::new(false)),
+            complete_solution_found: Arc::new(AtomicBool::new(false)),
+            progress_frontier_cache: None,
         }
     }
 
@@ -87,6 +162,14 @@ impl<'a> MacroSolver<'a> {
             .set_interrupt_signal(self.interrupt_signal.clone());
         self.step_lb_solver
             .set_interrupt_signal(self.interrupt_signal.clone());
+    }
+
+    pub fn improved_solution_signal(&self) -> Arc<AtomicBool> {
+        self.improved_solution_found.clone()
+    }
+
+    pub fn complete_solution_signal(&self) -> Arc<AtomicBool> {
+        self.complete_solution_found.clone()
     }
 
     /// Solve the complete remaining synthesis from an authoritative live state.
@@ -133,27 +216,107 @@ impl<'a> MacroSolver<'a> {
         incumbent_actions: &[Action],
         minimize_steps: bool,
     ) -> Result<Vec<Action>, SolverException> {
+        self.solve_from_state_with_condition_and_incumbent_anytime(
+            initial_state,
+            condition,
+            incumbent_actions,
+            minimize_steps,
+        )
+        .map(|outcome| outcome.actions)
+    }
+
+    pub fn solve_from_state_with_condition_and_incumbent_anytime(
+        &mut self,
+        initial_state: SimulationState,
+        condition: Condition,
+        incumbent_actions: &[Action],
+        minimize_steps: bool,
+    ) -> Result<MacroSolveOutcome, SolverException> {
         log::debug!(
             "rayon::current_num_threads() = {}",
             rayon::current_num_threads()
         );
 
         self.last_solve_runtime_stats = MacroSolverStats::default();
+        self.improved_solution_found.store(false, Ordering::Release);
+        self.complete_solution_found.store(false, Ordering::Release);
         let _total_time = ScopedTimer::new("Total Time");
 
+        let mut incumbent = self.incumbent_solution(initial_state, condition, incumbent_actions);
+        let completion = self
+            .progress_frontier_cache
+            .as_ref()
+            .filter(|cache| cache.root == initial_state && cache.condition == condition)
+            .and_then(|cache| cache.completion.clone());
+        let completion = if completion.is_some() {
+            completion
+        } else {
+            let frontier_solver =
+                ProgressFrontierSolver::new(self.settings, self.interrupt_signal.clone());
+            let completion = frontier_solver
+                .solve_with_expansion_limit(
+                    initial_state,
+                    condition,
+                    ProgressTarget::Complete,
+                    ProgressPolicy::Fastest,
+                    Some(100_000),
+                )
+                .into_iter()
+                .next()
+                .map(|endpoint| endpoint.actions);
+            if completion.is_some() {
+                self.progress_frontier_cache = Some(ProgressFrontierCache {
+                    root: initial_state,
+                    condition,
+                    completion: completion.clone(),
+                    one_short_prefixes: Vec::new(),
+                    one_short_attempted: false,
+                });
+            }
+            completion
+        };
+        if let Some(actions) = completion {
+            let completion = self
+                .incumbent_solution(initial_state, condition, &actions)
+                .expect("progress frontier returned a non-completing endpoint");
+            if incumbent
+                .as_ref()
+                .is_none_or(|current| completion.score > current.score)
+            {
+                incumbent = Some(completion);
+            }
+        }
+        if incumbent.is_some() {
+            self.complete_solution_found.store(true, Ordering::Release);
+        }
+        let cached_one_short = self
+            .progress_frontier_cache
+            .as_ref()
+            .filter(|cache| cache.root == initial_state && cache.condition == condition)
+            .filter(|cache| cache.one_short_attempted)
+            .map(|cache| cache.one_short_prefixes.clone());
+        let mut one_short_worker = (cached_one_short.is_none() && !self.interrupt_signal.is_set())
+            .then(|| OneShortWorker::start(self.settings, initial_state, condition));
         let timer = ScopedTimer::new("Finish Solver");
-        self.finish_solver.precompute()?;
+        if let Err(error) = self.finish_solver.precompute() {
+            return self.interrupted_outcome(error, incumbent);
+        }
         if condition == Condition::Normal
             && self.finish_solver.can_finish(&initial_state)? == Finishability::Impossible
         {
             self.last_solve_runtime_stats.finish_solver_stats = self.finish_solver.runtime_stats();
-            return Err(SolverException::NoSolution);
+            if incumbent.is_none() {
+                return Err(SolverException::NoSolution);
+            }
         }
         drop(timer);
 
         let timer = ScopedTimer::new("Quality UB Solver");
-        if !self.quality_ub_solver.is_precomputed() {
-            self.quality_ub_solver.precompute()?;
+        if !self.quality_ub_solver.is_precomputed()
+            && let Err(error) = self.quality_ub_solver.precompute()
+        {
+            self.quality_ub_solver.discard_precompute();
+            return self.interrupted_outcome(error, incumbent);
         }
         drop(timer);
 
@@ -162,7 +325,10 @@ impl<'a> MacroSolver<'a> {
         // subsequent state can reach max_quality, which in turn means the StepLbSolver is not needed.
         let initial_state_quality_ub = if condition == Condition::Normal {
             let mut shard = self.quality_ub_solver.create_shard();
-            let result = shard.quality_upper_bound(initial_state)?;
+            let result = match shard.quality_upper_bound_for_progress(initial_state) {
+                Ok(result) => result,
+                Err(error) => return self.interrupted_outcome(error, incumbent),
+            };
             self.quality_ub_solver
                 .extend_solved_states(shard.solved_states());
             result
@@ -171,21 +337,77 @@ impl<'a> MacroSolver<'a> {
         };
         if initial_state_quality_ub >= self.settings.max_quality() {
             let _timer = ScopedTimer::new("Step LB Solver");
-            if !self.step_lb_solver.is_precomputed() {
-                self.step_lb_solver.precompute()?;
+            if !self.step_lb_solver.is_precomputed()
+                && let Err(error) = self.step_lb_solver.precompute()
+            {
+                self.step_lb_solver.discard_precompute();
+                return self.interrupted_outcome(error, incumbent);
             }
         }
+        let one_short_prefixes = if let Some(prefixes) = cached_one_short {
+            prefixes
+        } else if self.interrupt_signal.is_set() {
+            Vec::new()
+        } else {
+            let prefixes = one_short_worker
+                .take()
+                .map(OneShortWorker::finish)
+                .unwrap_or_default();
+            if let Some(cache) = self.progress_frontier_cache.as_mut()
+                && cache.root == initial_state
+                && cache.condition == condition
+            {
+                cache.one_short_prefixes = prefixes.clone();
+                cache.one_short_attempted = true;
+            }
+            prefixes
+        };
 
         let timer = ScopedTimer::new("Search");
-        let incumbent = self.incumbent_solution(initial_state, condition, incumbent_actions);
-        let actions = self
-            .do_solve(initial_state, condition, incumbent, minimize_steps)?
-            .actions();
+        let (solution, optimal, quality_upper_bound) = self.do_solve(
+            initial_state,
+            condition,
+            incumbent,
+            one_short_prefixes,
+            minimize_steps,
+        )?;
         drop(timer);
 
         log::debug!("{:?}", self.runtime_stats());
 
-        Ok(actions)
+        let quality = solution.score.0.quality_upper_bound;
+        Ok(MacroSolveOutcome {
+            actions: solution.actions(),
+            optimal,
+            quality,
+            quality_upper_bound: quality_upper_bound.max(quality),
+            stats: self.runtime_stats(),
+        })
+    }
+
+    fn interrupted_outcome(
+        &mut self,
+        error: SolverException,
+        incumbent: Option<Solution>,
+    ) -> Result<MacroSolveOutcome, SolverException> {
+        if error != SolverException::Interrupted {
+            return Err(error);
+        }
+        let solution = incumbent.ok_or(SolverException::Interrupted)?;
+        self.last_solve_runtime_stats = MacroSolverStats {
+            search_queue_stats: SearchQueueStats::default(),
+            finish_solver_stats: self.finish_solver.runtime_stats(),
+            quality_ub_stats: self.quality_ub_solver.runtime_stats(),
+            step_lb_stats: self.step_lb_solver.runtime_stats(),
+        };
+        let quality = solution.score.0.quality_upper_bound;
+        Ok(MacroSolveOutcome {
+            actions: solution.actions(),
+            optimal: false,
+            quality,
+            quality_upper_bound: self.settings.max_quality(),
+            stats: self.runtime_stats(),
+        })
     }
 
     fn incumbent_solution(
@@ -232,16 +454,34 @@ impl<'a> MacroSolver<'a> {
         state: SimulationState,
         condition: Condition,
         incumbent: Option<Solution>,
+        one_short_prefixes: Vec<Vec<Action>>,
         minimize_steps: bool,
-    ) -> Result<Solution, SolverException> {
+    ) -> Result<(Solution, bool, u16), SolverException> {
         let mut search_queue = SearchQueue::new(self.settings, state, condition);
+        for prefix in one_short_prefixes {
+            let current_steps = u8::try_from(prefix.len()).unwrap_or(u8::MAX);
+            let current_duration = prefix.iter().fold(0_u8, |duration, action| {
+                duration.saturating_add(action.time_cost())
+            });
+            search_queue.seed_prefix(
+                &prefix,
+                SearchScore {
+                    quality_upper_bound: self.settings.max_quality(),
+                    steps_lower_bound: current_steps,
+                    duration_lower_bound: current_duration,
+                    current_steps,
+                    current_duration,
+                },
+            )?;
+        }
         let mut solution = incumbent;
         if !minimize_steps
             && solution.as_ref().is_some_and(|solution| {
                 solution.score.0.quality_upper_bound >= self.settings.max_quality()
             })
         {
-            return Ok(solution.unwrap());
+            let solution = solution.unwrap();
+            return Ok((solution, true, self.settings.max_quality()));
         }
         let score_floor = |solution: &Solution| {
             if minimize_steps {
@@ -262,7 +502,8 @@ impl<'a> MacroSolver<'a> {
             && score >= min_accepted_score
         {
             if self.interrupt_signal.is_set() {
-                return Err(SolverException::Interrupted);
+                let solution = solution.ok_or(SolverException::Interrupted)?;
+                return Ok((solution, false, score.quality_upper_bound));
             }
 
             let create_worker_data = || WorkerData {
@@ -285,7 +526,15 @@ impl<'a> MacroSolver<'a> {
                         Ok(worker_data)
                     },
                 )
-                .collect::<Result<Vec<_>, SolverException>>()?;
+                .collect::<Result<Vec<_>, SolverException>>();
+            let worker_results = match worker_results {
+                Ok(results) => results,
+                Err(SolverException::Interrupted) => {
+                    let solution = solution.ok_or(SolverException::Interrupted)?;
+                    return Ok((solution, false, score.quality_upper_bound));
+                }
+                Err(error) => return Err(error),
+            };
 
             // Finalize the workers to drop all shared references to `self` to satisfy the borrow checker.
             let worker_results = worker_results
@@ -303,6 +552,8 @@ impl<'a> MacroSolver<'a> {
                             && Some(worker_solution.score) > solution.as_ref().map(|s| s.score)))
                 {
                     solution = Some(worker_solution.clone());
+                    self.complete_solution_found.store(true, Ordering::Release);
+                    self.improved_solution_found.store(true, Ordering::Release);
                     (self.solution_callback)(&solution.as_ref().unwrap().actions());
                 }
             }
@@ -372,7 +623,9 @@ impl<'a> MacroSolver<'a> {
             return Err(SolverException::NoSolution);
         }
 
-        solution.ok_or(SolverException::NoSolution)
+        let solution = solution.ok_or(SolverException::NoSolution)?;
+        let quality_upper_bound = solution.score.0.quality_upper_bound;
+        Ok((solution, true, quality_upper_bound))
     }
 
     pub fn runtime_stats(&self) -> MacroSolverStats {

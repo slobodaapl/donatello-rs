@@ -10,7 +10,12 @@ mod step_lower_bound_solver;
 use step_lower_bound_solver::StepLbSolver;
 
 mod macro_solver;
-pub use macro_solver::MacroSolver;
+pub use macro_solver::{MacroSolveOutcome, MacroSolver, MacroSolverStats};
+
+mod progress_frontier_solver;
+pub use progress_frontier_solver::{
+    ProgressEndpoint, ProgressFrontierSolver, ProgressPolicy, ProgressTarget,
+};
 
 mod utils;
 pub use utils::AtomicFlag;

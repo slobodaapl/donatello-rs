@@ -10,6 +10,7 @@ crate-type = ["cdylib", "rlib"]
 raphael-sim = { workspace = true, features = ["serde"] }
 raphael-solver = { workspace = true }
 gathering-solvers = { workspace = true }
+rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = "1.0"
 

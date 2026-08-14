@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, hash_map::Entry};
 
-use raphael_sim::{Condition, SimulationState};
+use raphael_sim::{Action, Condition, SimulationState};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -108,13 +108,36 @@ impl SearchQueue {
             pareto_fronts: FxHashMap::default(),
             batch_ordering: BTreeSet::default(),
             batches: FxHashMap::default(),
-            visited_nodes: Vec::new(),
+            visited_nodes: vec![
+                SearchNode::new()
+                    .with_parent_idx(0)
+                    .with_action(ActionCombo::None),
+            ],
             num_inserted_nodes: 0,
             initial_state,
             initial_condition,
         };
         let _ = search_queue.push(SearchScore::MAX, ActionCombo::None, 0);
         search_queue
+    }
+
+    /// Add a reconstructed prefix as another root lane. The original unrestricted
+    /// root remains queued, so frontier seeding cannot remove reachable solutions.
+    pub fn seed_prefix(
+        &mut self,
+        actions: &[Action],
+        score: SearchScore,
+    ) -> Result<(), SolverException> {
+        let mut parent_idx = 0;
+        for &action in actions {
+            let node = SearchNode::new()
+                .with_parent_idx_checked(parent_idx)
+                .map_err(|_| SolverException::SearchQueueCapacityExceeded)?
+                .with_action(ActionCombo::Single(action));
+            self.visited_nodes.push(node);
+            parent_idx = self.visited_nodes.len() - 1;
+        }
+        self.push(score, ActionCombo::None, parent_idx)
     }
 
     pub fn push(
@@ -221,7 +244,12 @@ impl SearchQueue {
                     self.pareto_fronts
                         .entry(condition)
                         .or_default()
-                        .insert_batch(nodes, |expanded_node| &expanded_node.1),
+                        .insert_batch(
+                            nodes,
+                            |expanded_node| &expanded_node.1,
+                            score.current_steps,
+                            score.current_duration,
+                        ),
                 );
             }
             let batch = Batch {
@@ -349,5 +377,30 @@ mod tests {
             .unwrap();
         let normal = queue.pop_batch().unwrap().nodes[0];
         assert_eq!(normal.1, Condition::Normal);
+    }
+
+    #[test]
+    fn seeded_prefix_does_not_replace_unrestricted_anchor() {
+        let settings = settings();
+        let root = SimulationState::new(&settings.simulator_settings);
+        let mut queue = SearchQueue::new(settings, root, Condition::Normal);
+        queue
+            .seed_prefix(
+                &[Action::BasicSynthesis],
+                SearchScore {
+                    quality_upper_bound: settings.max_quality(),
+                    steps_lower_bound: 1,
+                    duration_lower_bound: 3,
+                    current_steps: 1,
+                    current_duration: 3,
+                },
+            )
+            .unwrap();
+
+        let anchor = queue.pop_batch().unwrap();
+        assert_eq!(anchor.nodes.len(), 1);
+        assert_eq!(anchor.nodes[0].0, root);
+        let seed = queue.pop_batch().unwrap();
+        assert!(seed.nodes[0].0.progress > root.progress);
     }
 }

@@ -93,6 +93,11 @@ impl StepLbSolver {
         Ok(())
     }
 
+    pub(crate) fn discard_precompute(&mut self) {
+        self.solved_states.clear();
+        self.num_states_solved_on_shards = 0;
+    }
+
     pub fn step_lower_bound(
         &mut self,
         state: SimulationState,

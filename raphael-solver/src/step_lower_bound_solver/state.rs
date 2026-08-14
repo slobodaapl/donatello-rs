@@ -41,8 +41,13 @@ impl ReducedState {
         // This decreases the number of possible states, as now there are only Active/Inactive states for TrainedPerfection instead of the usual Available/Active/Unavailable.
         // This also technically loosens the step-lb, but testing shows that rarely has any impact on the number of pruned nodes.
         effects.set_trained_perfection_available(true);
-        // Same thing for QuickInnovation. Just set it to always available.
+        // Specialist resources are an optimistic fixed relaxation here.  Resetting
+        // them on every reduction avoids separate 0/1/2-delineation live-root tables;
+        // unlimited access can only lower the resulting action-count bound.
+        effects.set_heart_and_soul_active(true);
+        effects.set_heart_and_soul_available(true);
         effects.set_quick_innovation_available(true);
+        effects.set_crafter_delineations(2);
         // Neither effect can reduce the minimum number of actions needed to reach the
         // progress/quality targets. Dropping them is therefore an admissible relaxation.
         effects.set_final_appraisal(0);
@@ -122,5 +127,35 @@ impl ReducedState {
             unreliable_quality: 0,
             effects: self.effects,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn specialist_resources_share_one_optimistic_step_bound_state() {
+        let settings = Settings {
+            max_cp: 500,
+            max_durability: 40,
+            max_progress: 500,
+            max_quality: 1000,
+            base_progress: 100,
+            base_quality: 100,
+            job_level: 100,
+            allowed_actions: ActionMask::all(),
+            adversarial: false,
+            backload_progress: false,
+            stellar_steady_hand_charges: 0,
+        };
+        let mut reduced = Vec::new();
+        for delineations in 0..=2 {
+            let mut root = SimulationState::new(&settings);
+            root.effects.set_crafter_delineations(delineations);
+            root.effects = root.effects.canonicalize_specialist_resources();
+            reduced.push(ReducedState::from_state(root, NonZeroU8::new(10).unwrap()));
+        }
+        assert!(reduced.windows(2).all(|pair| pair[0] == pair[1]));
     }
 }
