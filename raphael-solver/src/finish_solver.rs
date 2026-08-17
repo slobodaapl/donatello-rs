@@ -4,8 +4,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     SolverException, SolverSettings,
-    actions::{FULL_SEARCH_ACTIONS, PROGRESS_ONLY_SEARCH_ACTIONS, use_action_combo},
+    actions::{
+        FULL_SEARCH_ACTIONS, PROGRESS_ONLY_SEARCH_ACTIONS, has_stellar_window_resource,
+        remove_stellar_window_from_bound_settings, use_action_combo,
+    },
     macros::internal_error,
+    utils::AtomicFlag,
 };
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -59,6 +63,7 @@ pub struct FinishSolverStats {
 
 pub struct FinishSolver {
     settings: SolverSettings,
+    interrupt_signal: AtomicFlag,
     solved_states: FxHashMap<(u16, Effects), CpProgressBreakpoints>,
     /// The amount of CP required to guarantee being able to get Progess to 100% from any state.
     /// `None` if no such CP value exists.
@@ -74,12 +79,23 @@ pub(crate) enum Finishability {
 }
 
 impl FinishSolver {
-    pub fn new(settings: SolverSettings) -> Self {
+    pub fn new(mut settings: SolverSettings) -> Self {
+        remove_stellar_window_from_bound_settings(&mut settings.simulator_settings);
         Self {
             settings,
+            interrupt_signal: AtomicFlag::new(),
             solved_states: FxHashMap::default(),
             cp_for_guaranteed_finish: None,
         }
+    }
+
+    pub fn set_interrupt_signal(&mut self, interrupt_signal: AtomicFlag) {
+        self.interrupt_signal = interrupt_signal;
+    }
+
+    pub fn discard_precompute(&mut self) {
+        self.solved_states.clear();
+        self.cp_for_guaranteed_finish = None;
     }
 
     /// Calling this method before calling `FinishSolver::precompute` will return a `SolverException`.
@@ -91,6 +107,9 @@ impl FinishSolver {
             && required_cp <= state.cp
         {
             return Ok(Finishability::Proven);
+        }
+        if has_stellar_window_resource(state) {
+            return Ok(Finishability::Unknown);
         }
         let key = (state.durability, state.effects.strip_quality_effects());
         // Arbitrary live roots can contain effect durations/combinations absent from the
@@ -119,9 +138,17 @@ impl FinishSolver {
         }
         let mut templates = generate_templates(&self.settings);
         while !templates.is_empty() {
-            templates
-                .par_iter_mut()
-                .for_each(|template| self.solve_template(template));
+            if self.interrupt_signal.is_set() {
+                return Err(SolverException::Interrupted);
+            }
+            templates.par_iter_mut().for_each(|template| {
+                if !self.interrupt_signal.is_set() {
+                    self.solve_template(template);
+                }
+            });
+            if self.interrupt_signal.is_set() {
+                return Err(SolverException::Interrupted);
+            }
             if !templates.iter().any(|t| t.current_max_progress.is_some()) {
                 // At least one template must be solved for the precompute loop to make any progress.
                 // No template solved in this iteration means that there also won't be any templates solved in the next iteration and so on.
@@ -322,5 +349,17 @@ mod tests {
                 "missing finish bound for {delineations} delineations"
             );
         }
+    }
+
+    #[test]
+    fn stellar_resource_root_uses_unknown_instead_of_a_dynamic_bound_table() {
+        let settings = settings();
+        let solver = FinishSolver::new(settings);
+        let mut root = SimulationState::new(&settings.simulator_settings);
+        root.effects.set_stellar_steady_hand_charges(1);
+        assert_eq!(solver.can_finish(&root).unwrap(), Finishability::Unknown);
+        root.effects.set_stellar_steady_hand_charges(0);
+        root.effects.set_stellar_steady_hand(2);
+        assert_eq!(solver.can_finish(&root).unwrap(), Finishability::Unknown);
     }
 }

@@ -31,6 +31,7 @@ pub struct Ingredient {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RecipeLevel {
     pub job_level: u8,
     pub max_progress: u32,

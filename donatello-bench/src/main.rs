@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -22,6 +24,7 @@ const CONDITIONS: [Condition; 11] = [
 ];
 static DEADLINE_MILLIS: AtomicU64 = AtomicU64::new(0);
 static INITIAL_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static QUIET_FAILURES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 enum Mode {
@@ -74,6 +77,7 @@ struct ConditionSummary {
     scenarios: u64,
     strict_wins: u64,
     ties: u64,
+    losses: u64,
     rejected_candidates: u64,
     solve_failures: u64,
     completion_regressions: u64,
@@ -121,10 +125,30 @@ struct CorpusCase {
     name: String,
     job_level: Option<u8>,
     expert: Option<bool>,
+    #[serde(default)]
+    recipe_id: Option<u32>,
+    #[serde(default)]
+    item_id: Option<u32>,
+    #[serde(default)]
+    crafter_stats: Option<CrafterStats>,
+    #[serde(default)]
+    recipe_level: Option<raphael_data::RecipeLevel>,
     baseline_settings: Settings,
     adaptive_settings: Settings,
     #[serde(default)]
     crafter_delineations: u8,
+}
+
+struct RealFixture {
+    name: String,
+    recipe_id: u32,
+    item_id: u32,
+    job_level: u8,
+    expert: bool,
+    crafter_stats: CrafterStats,
+    recipe_level: raphael_data::RecipeLevel,
+    baseline_settings: Settings,
+    adaptive_settings: Settings,
 }
 
 #[derive(Deserialize)]
@@ -142,6 +166,32 @@ struct ReferenceCase {
     warm_micros: u128,
     action_ids: Vec<u32>,
     score: PlanScore,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeFfiResponse {
+    ok: bool,
+    action_ids: Option<Vec<u32>>,
+    optimal: Option<bool>,
+    quality_upper_bound: Option<u16>,
+    achieved_quality: Option<u16>,
+    progress_boundary: Option<RuntimeProgressBoundary>,
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeProgressBoundary {
+    action_count: usize,
+    target: String,
+}
+
+struct RuntimeSolveOutcome {
+    actions: Vec<Action>,
+    optimal: bool,
+    quality_bound_gap: u16,
+    staged_progress_plan: bool,
 }
 
 #[derive(Serialize)]
@@ -171,6 +221,10 @@ fn corpus_case_variants(
     name: String,
     job_level: Option<u8>,
     expert: Option<bool>,
+    recipe_id: Option<u32>,
+    item_id: Option<u32>,
+    crafter_stats: Option<CrafterStats>,
+    recipe_level: Option<raphael_data::RecipeLevel>,
     baseline_settings: Settings,
     adaptive_settings: Settings,
     repeat_specialist: bool,
@@ -179,6 +233,10 @@ fn corpus_case_variants(
         name: name.clone(),
         job_level,
         expert,
+        recipe_id,
+        item_id,
+        crafter_stats,
+        recipe_level,
         baseline_settings,
         adaptive_settings,
         crafter_delineations: 0,
@@ -199,6 +257,10 @@ fn corpus_case_variants(
                 name: format!("{name}-specialist-d{crafter_delineations}"),
                 job_level,
                 expert,
+                recipe_id,
+                item_id,
+                crafter_stats,
+                recipe_level,
                 baseline_settings: specialist_baseline,
                 adaptive_settings: specialist_adaptive,
                 crafter_delineations,
@@ -265,6 +327,109 @@ fn solver(settings: Settings) -> MacroSolver<'static> {
         Box::new(|_| {}),
         AtomicFlag::new(),
     )
+}
+
+fn condition_id(condition: Condition) -> u8 {
+    match condition {
+        Condition::Normal => 0,
+        Condition::Good => 1,
+        Condition::Excellent => 2,
+        Condition::Poor => 3,
+        Condition::Centered => 4,
+        Condition::Sturdy => 5,
+        Condition::Pliant => 6,
+        Condition::Malleable => 7,
+        Condition::Primed => 8,
+        Condition::GoodOmen => 9,
+        Condition::Robust => 10,
+    }
+}
+
+fn solve_runtime_ffi_staged(
+    settings: Settings,
+    root: SimulationState,
+    condition: Condition,
+    incumbent: &[Action],
+    crafter_delineations: u8,
+    progress_first: bool,
+) -> Result<RuntimeSolveOutcome, String> {
+    let deadline = DEADLINE_MILLIS.load(Ordering::Relaxed);
+    let request = serde_json::json!({
+        "abiVersion": 9,
+        "maxCp": settings.max_cp,
+        "maxDurability": settings.max_durability,
+        "maxProgress": settings.max_progress,
+        "maxQuality": settings.max_quality,
+        "baseProgress": settings.base_progress,
+        "baseQuality": settings.base_quality,
+        "jobLevel": settings.job_level,
+        "manipulation": settings.allowed_actions.has(Action::Manipulation),
+        "specialist": settings.allowed_actions.has(Action::HeartAndSoul)
+            || settings.allowed_actions.has(Action::QuickInnovation),
+        "allowCarefulObservation": false,
+        "solveMode": 2,
+        "minimizeSteps": true,
+        "progressFirst": progress_first,
+        "stellarSteadyHandCharges": root.effects.stellar_steady_hand_charges(),
+        "incumbentActionIds": incumbent.iter().map(|action| action.action_id()).collect::<Vec<_>>(),
+        "softDeadlineMillis": deadline,
+        "hardDeadlineMillis": deadline,
+        "bypassSolutionCache": true,
+        "root": {
+            "cp": root.cp,
+            "durability": root.durability,
+            "progress": root.progress,
+            "quality": root.quality,
+            "innerQuiet": root.effects.inner_quiet(),
+            "wasteNot": root.effects.waste_not(),
+            "manipulation": root.effects.manipulation(),
+            "innovation": root.effects.innovation(),
+            "veneration": root.effects.veneration(),
+            "greatStrides": root.effects.great_strides(),
+            "muscleMemory": root.effects.muscle_memory(),
+            "finalAppraisal": root.effects.final_appraisal(),
+            "carefulObservationCharges": root.effects.careful_observation_charges(),
+            "combo": root.effects.combo().into_bits(),
+            "heartAndSoulActive": root.effects.heart_and_soul_active(),
+            "heartAndSoulAvailable": root.effects.heart_and_soul_available(),
+            "quickInnovationAvailable": root.effects.quick_innovation_available(),
+            "trainedPerfectionActive": root.effects.trained_perfection_active(),
+            "trainedPerfectionAvailable": root.effects.trained_perfection_available(),
+            "stellarSteadyHandCharges": root.effects.stellar_steady_hand_charges(),
+            "stellarSteadyHand": root.effects.stellar_steady_hand(),
+            "splendorCosmic": root.effects.splendor_cosmic(),
+            "expedience": root.effects.expedience(),
+            "condition": condition_id(condition),
+            "crafterDelineations": crafter_delineations,
+        }
+    });
+    let response: RuntimeFfiResponse = serde_json::from_str(&donatello_ffi::solve_json(
+        &serde_json::to_vec(&request).map_err(|error| error.to_string())?,
+    ))
+    .map_err(|error| error.to_string())?;
+    if !response.ok {
+        return Err(response.error.unwrap_or_else(|| String::from("unknown FFI solve failure")));
+    }
+    let actions = response
+        .action_ids
+        .ok_or_else(|| String::from("FFI response omitted actions"))?
+        .into_iter()
+        .map(|id| Action::from_action_id(id).ok_or_else(|| format!("unknown FFI action {id}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let staged_progress_plan = response.progress_boundary.is_some_and(|boundary| {
+        boundary.target == "oneShort"
+            && boundary.action_count > 0
+            && boundary.action_count < actions.len()
+    });
+    Ok(RuntimeSolveOutcome {
+        actions,
+        optimal: response.optimal.unwrap_or(false),
+        quality_bound_gap: response
+            .quality_upper_bound
+            .unwrap_or_default()
+            .saturating_sub(response.achieved_quality.unwrap_or_default()),
+        staged_progress_plan,
+    })
 }
 
 fn start_deadline(
@@ -510,7 +675,7 @@ fn evaluate(
         state = next;
         executed += 1;
         duration += u16::from(action.time_cost());
-        if action.increases_step_count() {
+        if action.advances_condition() {
             condition = condition.deterministic_successor();
         }
     }
@@ -548,6 +713,7 @@ fn record_scenario(
     solve_duration: Duration,
     optimal: bool,
     quality_bound_gap: u16,
+    accept_staged_candidate: bool,
 ) {
     summary.scenarios += 1;
     summary.solve_micros += solve_duration.as_micros();
@@ -558,13 +724,16 @@ fn record_scenario(
     }
     let Ok(candidate) = candidate else {
         summary.solve_failures += 1;
+        summary.ties += 1;
         return;
     };
-    if candidate.strictly_better_than(incumbent) {
+    let selected = if candidate.strictly_better_than(incumbent) || accept_staged_candidate {
+        candidate
+    } else {
+        incumbent
+    };
+    if selected.strictly_better_than(incumbent) {
         summary.strict_wins += 1;
-        let selected = candidate;
-        assert!(selected.strictly_better_than(incumbent));
-        assert!(!incumbent.completes || selected.completes);
         summary.total_quality_gain += u64::from(selected.quality.saturating_sub(incumbent.quality));
         summary.max_quality_gain = summary
             .max_quality_gain
@@ -573,13 +742,25 @@ fn record_scenario(
             i64::from(incumbent.actions) - i64::from(selected.actions);
         summary.total_duration_reduction +=
             i64::from(incumbent.duration) - i64::from(selected.duration);
-    } else if candidate == incumbent {
+    } else if selected == incumbent {
         summary.ties += 1;
+        if candidate != incumbent {
+            summary.rejected_candidates += 1;
+        }
     } else {
-        summary.rejected_candidates += 1;
+        summary.losses += 1;
     }
-    if incumbent.completes && candidate.strictly_better_than(incumbent) && !candidate.completes {
+    if incumbent.completes && !selected.completes {
         summary.completion_regressions += 1;
+    }
+}
+
+#[cfg(test)]
+fn select_candidate(incumbent: PlanScore, candidate: PlanScore) -> PlanScore {
+    if candidate.strictly_better_than(incumbent) {
+        candidate
+    } else {
+        incumbent
     }
 }
 
@@ -587,6 +768,7 @@ fn merge(target: &mut ConditionSummary, source: &ConditionSummary) {
     target.scenarios += source.scenarios;
     target.strict_wins += source.strict_wins;
     target.ties += source.ties;
+    target.losses += source.losses;
     target.rejected_candidates += source.rejected_candidates;
     target.solve_failures += source.solve_failures;
     target.completion_regressions += source.completion_regressions;
@@ -609,6 +791,7 @@ fn run_case(
     baseline_settings: Settings,
     adaptive_settings: Settings,
     crafter_delineations: u8,
+    runtime_ffi: bool,
 ) -> Option<FixtureSummary> {
     let started = Instant::now();
     eprintln!("running fixture: {name}");
@@ -648,30 +831,57 @@ fn run_case(
         for (index, &root) in boundaries.iter().enumerate() {
             let incumbent = evaluate(&adaptive_settings, root, condition, &baseline[index..]);
             let solve_started = Instant::now();
-            let interrupt = AtomicFlag::new();
-            donatello.set_interrupt_signal(interrupt.clone());
-            let (deadline_done, deadline_worker) = start_deadline(interrupt);
-            let solved = donatello.solve_from_state_with_condition_and_incumbent_anytime(
-                root,
-                condition,
-                &baseline[index..],
-                true,
-            );
-            finish_deadline(deadline_done, deadline_worker);
-            let (optimal, quality_bound_gap) = solved.as_ref().map_or((false, 0), |outcome| {
-                (
-                    outcome.optimal,
-                    outcome.quality_upper_bound.saturating_sub(outcome.quality),
+            let solved = if runtime_ffi {
+                solve_runtime_ffi_staged(
+                    adaptive_settings,
+                    root,
+                    condition,
+                    &baseline[index..],
+                    crafter_delineations,
+                    expert != Some(true),
                 )
-            });
+            } else {
+                let interrupt = AtomicFlag::new();
+                donatello.set_interrupt_signal(interrupt.clone());
+                let (deadline_done, deadline_worker) = start_deadline(interrupt);
+                let result = donatello
+                    .solve_from_state_with_condition_and_incumbent_anytime(
+                        root,
+                        condition,
+                        &baseline[index..],
+                        true,
+                    )
+                    .map(|outcome| RuntimeSolveOutcome {
+                        actions: outcome.actions,
+                        optimal: outcome.optimal,
+                        quality_bound_gap: outcome
+                            .quality_upper_bound
+                            .saturating_sub(outcome.quality),
+                        staged_progress_plan: false,
+                    })
+                    .map_err(|error| format!("{error:?}"));
+                finish_deadline(deadline_done, deadline_worker);
+                result
+            };
+            let (optimal, quality_bound_gap, _staged_progress_plan) = solved
+                .as_ref()
+                .map_or((false, 0, false), |outcome| {
+                    (
+                        outcome.optimal,
+                        outcome.quality_bound_gap,
+                        outcome.staged_progress_plan,
+                    )
+                });
             let candidate = solved
                 .map(|outcome| evaluate(&adaptive_settings, root, condition, &outcome.actions))
                 .map_err(|error| {
-                    eprintln!(
-                        "solve failure: fixture={}, condition={condition:?}, boundary={index}, root={root:?}, incumbent={incumbent:?}, incumbent_actions={:?}, error={error:?}",
-                        name,
-                        &baseline[index..],
-                    );
+                    if !QUIET_FAILURES.load(Ordering::Relaxed) {
+                        eprintln!(
+                            "solve failure: fixture={}, condition={condition:?}, boundary={index}, root={root:?}, incumbent={incumbent:?}, incumbent_actions={:?}, error={error:?}",
+                            name,
+                            &baseline[index..],
+                        );
+                    }
                 });
             record_scenario(
                 &mut summary,
@@ -680,6 +890,7 @@ fn run_case(
                 solve_started.elapsed(),
                 optimal,
                 quality_bound_gap,
+                false,
             );
         }
         assert_eq!(summary.completion_regressions, 0);
@@ -697,7 +908,7 @@ fn run_case(
     })
 }
 
-fn real_fixtures(mode: Mode) -> Vec<(String, u8, bool, Settings, Settings)> {
+fn real_fixtures(mode: Mode) -> Vec<RealFixture> {
     const CRAFTER_CURVE: [(u8, u16, u16, u16); 10] = [
         (10, 50, 45, 200),
         (20, 110, 100, 230),
@@ -735,7 +946,7 @@ fn real_fixtures(mode: Mode) -> Vec<(String, u8, bool, Settings, Settings)> {
             })
             .map(|(recipe_id, recipe)| {
                 let mut settings = get_game_settings(*recipe, None, crafter, None, None);
-                settings.allowed_actions = action_mask(mode, false);
+                settings.allowed_actions = action_mask(mode, true);
                 (recipe_id, *recipe, settings)
             })
             .collect::<Vec<_>>();
@@ -752,95 +963,146 @@ fn real_fixtures(mode: Mode) -> Vec<(String, u8, bool, Settings, Settings)> {
             "level bracket {bracket_start}-{job_level} has fewer than ten eligible regular recipes"
         );
         for (recipe_id, recipe, baseline) in candidates.into_iter().take(10) {
+            let recipe_level = RLVLS[recipe.recipe_level as usize];
             let mut adaptive = baseline;
             adaptive.allowed_actions = action_mask(mode, true);
-            result.push((
-                format!(
+            result.push(RealFixture {
+                name: format!(
                     "L{job_level}-regular-recipe{recipe_id}-item{}",
                     recipe.item_id
                 ),
+                recipe_id,
+                item_id: recipe.item_id,
                 job_level,
-                false,
-                baseline,
-                adaptive,
-            ));
+                expert: false,
+                crafter_stats: crafter,
+                recipe_level,
+                baseline_settings: baseline,
+                adaptive_settings: adaptive,
+            });
         }
     }
 
-    let expert_crafter = CrafterStats {
-        craftsmanship: 5200,
-        control: 4800,
-        cp: 630,
-        level: 100,
-        manipulation: true,
-        heart_and_soul: false,
-        quick_innovation: false,
-    };
-    let mut experts = RECIPES
-        .entries()
-        .filter(|(_, recipe)| {
-            recipe.max_level_scaling == 0
-                && recipe.is_expert
-                && RLVLS[recipe.recipe_level as usize].job_level == 100
-                && recipe.req_craftsmanship <= expert_crafter.craftsmanship
-                && recipe.req_control <= expert_crafter.control
-        })
-        .map(|(recipe_id, recipe)| {
-            let mut settings = get_game_settings(*recipe, None, expert_crafter, None, None);
-            settings.allowed_actions = action_mask(mode, false);
-            (recipe_id, *recipe, settings)
-        })
-        .collect::<Vec<_>>();
-    experts.sort_by_key(|(recipe_id, _, settings)| {
-        (
-            (settings.max_progress as u32) * (settings.max_quality as u32),
-            *recipe_id,
-        )
-    });
-    assert!(
-        experts.len() >= 10,
-        "fewer than ten eligible level-100 expert recipes"
-    );
-    let mut sampled_indices = (0..10)
-        .map(|index| index * (experts.len() - 1) / 9)
-        .collect::<Vec<_>>();
-    if let Some(recipe_38202_index) = experts.iter().position(|(id, _, _)| *id == 38202)
-        && !sampled_indices.contains(&recipe_38202_index)
+    for (job_level, craftsmanship, control, cp) in CRAFTER_CURVE
+        .into_iter()
+        .filter(|(job_level, _, _, _)| matches!(job_level, 80 | 100))
     {
-        let replacement = sampled_indices
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, sampled)| (**sampled).abs_diff(recipe_38202_index))
-            .map(|(index, _)| index)
-            .unwrap();
-        sampled_indices[replacement] = recipe_38202_index;
-        sampled_indices.sort_unstable();
-    }
-    for index in sampled_indices {
-        let (recipe_id, recipe, mut baseline) = experts[index];
-        if recipe_id == 38202 {
-            let logged_crafter = CrafterStats {
-                craftsmanship: 5328,
-                control: 4779,
-                cp: 573,
-                ..expert_crafter
-            };
-            baseline = get_game_settings(recipe, None, logged_crafter, None, None);
-            baseline.allowed_actions = action_mask(mode, false);
+        let expert_crafter = CrafterStats {
+            craftsmanship,
+            control,
+            cp,
+            level: job_level,
+            manipulation: true,
+            heart_and_soul: false,
+            quick_innovation: false,
+        };
+        let mut experts = RECIPES
+            .entries()
+            .filter(|(_, recipe)| {
+                recipe.max_level_scaling == 0
+                    && recipe.is_expert
+                    && RLVLS[recipe.recipe_level as usize].job_level == job_level
+                    && recipe.req_craftsmanship <= expert_crafter.craftsmanship
+                    && recipe.req_control <= expert_crafter.control
+            })
+            .map(|(recipe_id, recipe)| {
+                let mut settings = get_game_settings(*recipe, None, expert_crafter, None, None);
+                settings.allowed_actions = action_mask(mode, true);
+                (recipe_id, *recipe, settings)
+            })
+            .collect::<Vec<_>>();
+        experts.sort_by_key(|(recipe_id, _, settings)| {
+            (
+                (settings.max_progress as u32) * (settings.max_quality as u32),
+                *recipe_id,
+            )
+        });
+        assert!(
+            !experts.is_empty(),
+            "no eligible level-{job_level} expert recipes"
+        );
+        let sample_count = experts.len().min(10);
+        let mut sampled_indices = if sample_count == 1 {
+            vec![0]
+        } else {
+            (0..sample_count)
+                .map(|index| index * (experts.len() - 1) / (sample_count - 1))
+                .collect::<Vec<_>>()
+        };
+        if job_level == 100
+            && let Some(recipe_38202_index) = experts.iter().position(|(id, _, _)| *id == 38202)
+            && !sampled_indices.contains(&recipe_38202_index)
+        {
+            let replacement = sampled_indices
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, sampled)| (**sampled).abs_diff(recipe_38202_index))
+                .map(|(index, _)| index)
+                .unwrap();
+            sampled_indices[replacement] = recipe_38202_index;
+            sampled_indices.sort_unstable();
         }
-        let mut adaptive = baseline;
-        adaptive.allowed_actions = action_mask(mode, true);
-        result.push((
+        for index in sampled_indices {
+            let (recipe_id, recipe, mut baseline) = experts[index];
+            let mut selected_crafter = expert_crafter;
             if recipe_id == 38202 {
-                String::from("recipe38202-logged-stats")
-            } else {
-                format!("L100-expert-recipe{recipe_id}-item{}", recipe.item_id)
-            },
-            100,
-            true,
-            baseline,
-            adaptive,
-        ));
+                let logged_crafter = CrafterStats {
+                    craftsmanship: 5328,
+                    control: 4779,
+                    cp: 573,
+                    ..expert_crafter
+                };
+                baseline = get_game_settings(recipe, None, logged_crafter, None, None);
+                baseline.allowed_actions = action_mask(mode, true);
+                selected_crafter = logged_crafter;
+            }
+            let mut adaptive = baseline;
+            adaptive.allowed_actions = action_mask(mode, true);
+            result.push(RealFixture {
+                name: if recipe_id == 38202 {
+                    String::from("recipe38202-logged-stats")
+                } else {
+                    format!("L{job_level}-expert-recipe{recipe_id}-item{}", recipe.item_id)
+                },
+                recipe_id,
+                item_id: recipe.item_id,
+                job_level,
+                expert: true,
+                crafter_stats: selected_crafter,
+                recipe_level: RLVLS[recipe.recipe_level as usize],
+                baseline_settings: baseline,
+                adaptive_settings: adaptive,
+            });
+        }
+    }
+    if matches!(mode, Mode::Full) {
+        let logged_crafter = CrafterStats {
+            craftsmanship: 1425,
+            control: 1314,
+            cp: 387,
+            level: 91,
+            manipulation: false,
+            heart_and_soul: false,
+            quick_innovation: false,
+        };
+        for recipe_id in [35643, 35644] {
+            let recipe = *RECIPES
+                .get(recipe_id)
+                .unwrap_or_else(|| panic!("missing logged regression recipe {recipe_id}"));
+            let mut baseline = get_game_settings(recipe, None, logged_crafter, None, None);
+            baseline.allowed_actions = action_mask(mode, true);
+            result.push(RealFixture {
+                name: format!("regression-recipe{recipe_id}-logged-l91"),
+                recipe_id,
+                item_id: recipe.item_id,
+                job_level: 91,
+                expert: false,
+                crafter_stats: logged_crafter,
+                recipe_level: RLVLS[recipe.recipe_level as usize],
+                baseline_settings: baseline,
+                adaptive_settings: baseline,
+            });
+        }
     }
     result
 }
@@ -892,6 +1154,7 @@ fn main() {
     let mut corpus_path = None;
     let mut reference_results_path = None;
     let mut comparison_output_path = None;
+    let mut output_path = None;
     let mut name_filter = None;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
@@ -930,12 +1193,15 @@ fn main() {
                         .expect("--comparison-output requires a path"),
                 );
             }
+            "--output" => {
+                output_path = Some(arguments.next().expect("--output requires a path"));
+            }
             "--filter" => {
                 name_filter = Some(arguments.next().expect("--filter requires text"));
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: donatello-bench [--quick|--full] [--real|--expert-high] [--summary] [--json] [--deadline-ms N] [--initial-only] [--filter TEXT] [--emit-corpus PATH|--corpus PATH] [--compare-reference PATH] [--comparison-output PATH]"
+                    "Usage: donatello-bench [--quick|--full] [--real|--expert-high] [--summary] [--json] [--output PATH] [--deadline-ms N] [--initial-only] [--filter TEXT] [--emit-corpus PATH|--corpus PATH] [--compare-reference PATH] [--comparison-output PATH]"
                 );
                 return;
             }
@@ -943,9 +1209,10 @@ fn main() {
         }
     }
 
+    QUIET_FAILURES.store(summary_only, Ordering::Relaxed);
     let mut real_cases = real_fixtures(mode);
     if expert_high {
-        real_cases.retain(|(_, level, expert, _, _)| *expert && *level >= 90);
+        real_cases.retain(|case| case.expert && case.job_level >= 90);
         real_cases.reverse();
         real_cases.truncate(if matches!(mode, Mode::Quick) { 2 } else { 10 });
     }
@@ -958,25 +1225,31 @@ fn main() {
     } else if real {
         let mut cases = real_cases
             .into_iter()
-            .flat_map(
-                |(name, job_level, expert, baseline_settings, adaptive_settings)| {
-                    corpus_case_variants(
-                        name,
-                        Some(job_level),
-                        Some(expert),
-                        baseline_settings,
-                        adaptive_settings,
-                        job_level >= 90,
-                    )
-                },
-            )
+            .flat_map(|case| {
+                corpus_case_variants(
+                    case.name,
+                    Some(case.job_level),
+                    Some(case.expert),
+                    Some(case.recipe_id),
+                    Some(case.item_id),
+                    Some(case.crafter_stats),
+                    Some(case.recipe_level),
+                    case.baseline_settings,
+                    case.adaptive_settings,
+                    case.job_level >= 90,
+                )
+            })
             .collect::<Vec<_>>();
         for fixture in fixtures(mode) {
             cases.extend(corpus_case_variants(
                 fixture.name.to_owned(),
                 None,
                 None,
-                settings(*fixture, mode, false),
+                None,
+                None,
+                None,
+                None,
+                settings(*fixture, mode, true),
                 settings(*fixture, mode, true),
                 true,
             ));
@@ -990,7 +1263,11 @@ fn main() {
                 name: fixture.name.to_owned(),
                 job_level: None,
                 expert: None,
-                baseline_settings: settings(fixture, mode, false),
+                recipe_id: None,
+                item_id: None,
+                crafter_stats: None,
+                recipe_level: None,
+                baseline_settings: settings(fixture, mode, true),
                 adaptive_settings: settings(fixture, mode, true),
                 crafter_delineations: 0,
             })
@@ -1000,6 +1277,10 @@ fn main() {
         corpus_cases.retain(|case| case.name.contains(&filter));
     }
     corpus_cases.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
+    assert!(
+        !real || matches!(mode, Mode::Full),
+        "--real exercises the runtime FFI action set and therefore requires --full"
+    );
     if let Some(path) = emit_corpus {
         let mut bytes = serde_json::to_vec_pretty(&Corpus {
             version: 1,
@@ -1052,6 +1333,7 @@ fn main() {
                     case.baseline_settings,
                     case.adaptive_settings,
                     case.crafter_delineations,
+                    real,
                 )
             })
             .collect(),
@@ -1064,15 +1346,22 @@ fn main() {
     }
     assert_eq!(report.totals.completion_regressions, 0);
 
+    if let Some(path) = output_path {
+        let mut bytes = serde_json::to_vec_pretty(&report).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(path, bytes).expect("failed to write benchmark report");
+    }
+
     if json {
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
     } else {
         println!(
-            "Donatello benchmark ({}) — {} scenarios, {} strict wins, {} ties, {} rejected, {} solve failures, {} completion regressions, {} bounded returns, max quality gap {}",
+            "Donatello benchmark ({}) — {} scenarios, {} strict wins, {} ties, {} losses, {} rejected, {} solve failures, {} completion regressions, {} bounded returns, max quality gap {}",
             report.mode,
             report.totals.scenarios,
             report.totals.strict_wins,
             report.totals.ties,
+            report.totals.losses,
             report.totals.rejected_candidates,
             report.totals.solve_failures,
             report.totals.completion_regressions,
@@ -1082,22 +1371,29 @@ fn main() {
         if real {
             let mut cohorts: BTreeMap<(u8, bool), ConditionSummary> = BTreeMap::new();
             for fixture in &report.fixtures {
-                let key = (fixture.job_level.unwrap(), fixture.expert.unwrap());
+                let (Some(level), Some(expert)) = (fixture.job_level, fixture.expert) else {
+                    continue;
+                };
+                let key = (level, expert);
                 let cohort = cohorts.entry(key).or_default();
                 for summary in fixture.conditions.values() {
                     merge(cohort, summary);
                 }
             }
-            println!("\nStrict-win rate by real-recipe cohort:");
+            println!("\nRuntime win/tie/loss rate by real-recipe cohort:");
             for ((level, expert), cohort) in cohorts {
-                let rate = 100.0 * cohort.strict_wins as f64 / cohort.scenarios as f64;
-                let bar = "█".repeat((rate / 2.0).round() as usize);
+                let denominator = cohort.scenarios.max(1) as f64;
+                let win_rate = 100.0 * cohort.strict_wins as f64 / denominator;
+                let tie_rate = 100.0 * cohort.ties as f64 / denominator;
+                let loss_rate = 100.0 * cohort.losses as f64 / denominator;
+                let bar = "█".repeat((win_rate / 2.0).round() as usize);
                 println!(
-                    "  L{level:>3} {:>7}: {:>6.2}% ({}/{}) {bar}",
+                    "  L{level:>3} {:>7}: win {win_rate:>6.2}% / tie {tie_rate:>6.2}% / loss {loss_rate:>6.2}% ({}/{}/{}) / solver failures {} {bar}",
                     if expert { "expert" } else { "regular" },
-                    rate,
                     cohort.strict_wins,
-                    cohort.scenarios,
+                    cohort.ties,
+                    cohort.losses,
+                    cohort.solve_failures,
                 );
             }
         }
@@ -1119,10 +1415,11 @@ fn main() {
             );
             for (condition, summary) in &fixture.conditions {
                 println!(
-                    "    {condition}: {}/{} strict wins, {} ties, {} rejected, {} failures",
+                    "    {condition}: {}/{} strict wins, {} ties, {} losses, {} rejected, {} failures",
                     summary.strict_wins,
                     summary.scenarios,
                     summary.ties,
+                    summary.losses,
                     summary.rejected_candidates,
                     summary.solve_failures,
                 );
@@ -1139,7 +1436,7 @@ mod tests {
     fn comparison_is_completion_first_and_lexicographic() {
         let complete = PlanScore {
             completes: true,
-            quality: 0,
+            quality: 100,
             actions: 10,
             duration: 30,
         };
@@ -1151,6 +1448,18 @@ mod tests {
         };
         assert!(complete.strictly_better_than(incomplete));
         assert!(!incomplete.strictly_better_than(complete));
+        assert_eq!(select_candidate(complete, incomplete), complete);
+
+        let worse_quality = PlanScore {
+            quality: 99,
+            ..complete
+        };
+        let better_quality = PlanScore {
+            quality: 101,
+            ..complete
+        };
+        assert_eq!(select_candidate(complete, worse_quality), complete);
+        assert_eq!(select_candidate(complete, better_quality), better_quality);
     }
 
     #[test]
@@ -1179,21 +1488,30 @@ mod tests {
             assert_eq!(
                 cases
                     .iter()
-                    .filter(|(_, case_level, expert, _, _)| { *case_level == level && !*expert })
+                    .filter(|case| case.job_level == level && !case.expert)
                     .count(),
                 10,
                 "level bracket ending at {level}"
             );
         }
+        for (level, expected) in [(80, 8), (100, 10)] {
+            assert_eq!(
+                cases
+                    .iter()
+                    .filter(|case| case.job_level == level && case.expert)
+                    .count(),
+                expected,
+                "level-{level} expert recipes"
+            );
+        }
         let experts = cases
             .iter()
-            .filter(|(_, level, expert, _, _)| *level == 100 && *expert)
+            .filter(|case| case.expert)
             .collect::<Vec<_>>();
-        assert_eq!(experts.len(), 10);
         assert!(
             experts
                 .iter()
-                .any(|(name, _, _, _, _)| name == "recipe38202-logged-stats")
+                .any(|case| case.name == "recipe38202-logged-stats")
         );
     }
 }

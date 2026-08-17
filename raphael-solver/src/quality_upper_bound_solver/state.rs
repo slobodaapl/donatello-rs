@@ -66,9 +66,12 @@ impl ReducedState {
                 // Final Appraisal cannot increase attainable quality. Ignoring it is a
                 // conservative relaxation and avoids adding a zero-step cycle to this DP.
                 .with_final_appraisal(0)
-                // Careful Observation is intentionally absent from deterministic search;
-                // its remaining charges therefore cannot affect this upper bound.
+                // This relaxation already models Normal-condition quality. Careful Observation
+                // cannot improve that bound, so its remaining charges must not split tables.
                 .with_careful_observation_charges(0)
+                // This bound models Normal-condition actions. The Cosmic tool bonus only
+                // changes Good-condition quality and must not split otherwise equal tables.
+                .with_splendor_cosmic(false)
                 .canonicalize_specialist_resources()
         };
         Some(Self {
@@ -129,5 +132,37 @@ impl ReducedState {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cosmic_tool_uses_the_normal_condition_bound_state() {
+        let settings = SolverSettings {
+            simulator_settings: Settings {
+                max_cp: 500,
+                max_durability: 40,
+                max_progress: 500,
+                max_quality: 1000,
+                base_progress: 100,
+                base_quality: 100,
+                job_level: 100,
+                allowed_actions: ActionMask::regular(),
+                adversarial: false,
+                backload_progress: false,
+                stellar_steady_hand_charges: 0,
+            },
+            allow_non_max_quality_solutions: true,
+        };
+        let normal = SimulationState::new(&settings.simulator_settings);
+        let mut cosmic = normal;
+        cosmic.effects.set_splendor_cosmic(true);
+        assert_eq!(
+            ReducedState::from_state(normal, &settings, 10),
+            ReducedState::from_state(cosmic, &settings, 10)
+        );
     }
 }

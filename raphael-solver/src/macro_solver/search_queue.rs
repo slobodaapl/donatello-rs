@@ -80,6 +80,13 @@ pub struct Batch {
     pub nodes: Vec<(SimulationState, Condition, usize)>,
 }
 
+#[derive(Debug, Clone)]
+pub struct QueueCandidate {
+    pub score: SearchScore,
+    pub actions: SmallVec<[ActionCombo; 4]>,
+    pub parent_idx: usize,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SearchQueueStats {
     pub inserted_nodes: usize,
@@ -103,6 +110,23 @@ impl SearchQueue {
         initial_state: SimulationState,
         initial_condition: Condition,
     ) -> Self {
+        Self::with_anchor(settings, initial_state, initial_condition, true)
+    }
+
+    pub(crate) fn seeded(
+        settings: SolverSettings,
+        initial_state: SimulationState,
+        initial_condition: Condition,
+    ) -> Self {
+        Self::with_anchor(settings, initial_state, initial_condition, false)
+    }
+
+    fn with_anchor(
+        settings: SolverSettings,
+        initial_state: SimulationState,
+        initial_condition: Condition,
+        include_anchor: bool,
+    ) -> Self {
         let mut search_queue = Self {
             settings,
             pareto_fronts: FxHashMap::default(),
@@ -117,12 +141,13 @@ impl SearchQueue {
             initial_state,
             initial_condition,
         };
-        let _ = search_queue.push(SearchScore::MAX, ActionCombo::None, 0);
+        if include_anchor {
+            let _ = search_queue.push(SearchScore::MAX, ActionCombo::None, 0);
+        }
         search_queue
     }
 
-    /// Add a reconstructed prefix as another root lane. The original unrestricted
-    /// root remains queued, so frontier seeding cannot remove reachable solutions.
+    /// Add a reconstructed prefix as another root lane.
     pub fn seed_prefix(
         &mut self,
         actions: &[Action],
@@ -146,10 +171,16 @@ impl SearchQueue {
         action: ActionCombo,
         parent_idx: usize,
     ) -> Result<(), SolverException> {
-        let node = SearchNode::new()
-            .with_parent_idx_checked(parent_idx)
-            .map_err(|_| SolverException::SearchQueueCapacityExceeded)?
-            .with_action(action);
+        self.push_transition(score, &[action], parent_idx)
+    }
+
+    pub fn push_transition(
+        &mut self,
+        score: SearchScore,
+        actions: &[ActionCombo],
+        parent_idx: usize,
+    ) -> Result<(), SolverException> {
+        let node = self.transition_node(actions, parent_idx)?;
         match self.batches.entry(score) {
             Entry::Occupied(occupied_entry) => {
                 occupied_entry.into_mut().push(node);
@@ -165,22 +196,21 @@ impl SearchQueue {
 
     pub fn push_batch(
         &mut self,
-        mut candidates: Vec<(SearchScore, ActionCombo, usize)>,
+        mut candidates: Vec<QueueCandidate>,
     ) -> Result<(), SolverException> {
-        candidates.par_sort_unstable_by_key(|candidate| candidate.0);
-        let mut begin = 0;
-        while begin < candidates.len() {
-            let score = candidates[begin].0;
-            let end = begin + candidates[begin..].partition_point(|candidate| candidate.0 == score);
-            let mut nodes = Vec::with_capacity(end - begin);
-            for &(_, action, parent_idx) in &candidates[begin..end] {
-                nodes.push(
-                    SearchNode::new()
-                        .with_parent_idx_checked(parent_idx)
-                        .map_err(|_| SolverException::SearchQueueCapacityExceeded)?
-                        .with_action(action),
-                );
+        candidates.par_sort_unstable_by_key(|candidate| candidate.score);
+        let mut candidates = candidates.into_iter().peekable();
+        while let Some(candidate) = candidates.next() {
+            let score = candidate.score;
+            let mut nodes = vec![self.transition_node(&candidate.actions, candidate.parent_idx)?];
+            while candidates
+                .peek()
+                .is_some_and(|candidate| candidate.score == score)
+            {
+                let candidate = candidates.next().unwrap();
+                nodes.push(self.transition_node(&candidate.actions, candidate.parent_idx)?);
             }
+            let node_count = nodes.len();
             match self.batches.entry(score) {
                 Entry::Occupied(entry) => entry.into_mut().extend(nodes),
                 Entry::Vacant(entry) => {
@@ -188,10 +218,31 @@ impl SearchQueue {
                     entry.insert(nodes);
                 }
             }
-            self.num_inserted_nodes += end - begin;
-            begin = end;
+            self.num_inserted_nodes += node_count;
         }
         Ok(())
+    }
+
+    fn transition_node(
+        &mut self,
+        actions: &[ActionCombo],
+        mut parent_idx: usize,
+    ) -> Result<SearchNode, SolverException> {
+        let (&last, prefix) = actions
+            .split_last()
+            .expect("search transitions must contain at least one action");
+        for &action in prefix {
+            let node = SearchNode::new()
+                .with_parent_idx_checked(parent_idx)
+                .map_err(|_| SolverException::SearchQueueCapacityExceeded)?
+                .with_action(action);
+            self.visited_nodes.push(node);
+            parent_idx = self.visited_nodes.len() - 1;
+        }
+        SearchNode::new()
+            .with_parent_idx_checked(parent_idx)
+            .map_err(|_| SolverException::SearchQueueCapacityExceeded)
+            .map(|node| node.with_action(last))
     }
 
     pub fn drop_nodes_below_score(&mut self, min_score: SearchScore) {
@@ -377,6 +428,41 @@ mod tests {
             .unwrap();
         let normal = queue.pop_batch().unwrap().nodes[0];
         assert_eq!(normal.1, Condition::Normal);
+    }
+
+    #[test]
+    fn queued_stellar_transition_reconstructs_every_concrete_action() {
+        let mut settings = settings();
+        settings.simulator_settings.stellar_steady_hand_charges = 1;
+        let root = SimulationState::new(&settings.simulator_settings);
+        let mut queue = SearchQueue::new(settings, root, Condition::Normal);
+        let anchor = queue.pop_batch().unwrap().nodes[0];
+        let actions = [
+            ActionCombo::Single(Action::StellarSteadyHand),
+            ActionCombo::Single(Action::HastyTouch),
+            ActionCombo::Single(Action::DaringTouch),
+            ActionCombo::Single(Action::HastyTouch),
+        ];
+        queue
+            .push_transition(SearchScore::MAX, &actions, anchor.2)
+            .unwrap();
+        let endpoint = queue.pop_batch().unwrap().nodes[0];
+        let reconstructed = queue
+            .get_actions_from_node_idx(endpoint.2)
+            .iter()
+            .flat_map(|action| action.actions().iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reconstructed,
+            [
+                Action::StellarSteadyHand,
+                Action::HastyTouch,
+                Action::DaringTouch,
+                Action::HastyTouch,
+            ]
+        );
+        assert_eq!(endpoint.0.effects.stellar_steady_hand(), 0);
+        assert!(endpoint.0.quality > 0);
     }
 
     #[test]

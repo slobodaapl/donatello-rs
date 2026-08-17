@@ -3,10 +3,11 @@ use rayon::prelude::*;
 
 use super::search_queue::{SearchQueueStats, SearchScore};
 use crate::actions::{
-    ActionCombo, FULL_SEARCH_ACTIONS, use_action_combo, use_action_combo_with_condition,
+    ActionCombo, FULL_SEARCH_ACTIONS, final_appraisal_is_dominated,
+    stellar_window_transitions, use_action_combo, use_action_combo_with_condition,
 };
 use crate::finish_solver::{FinishSolverStats, Finishability};
-use crate::macro_solver::search_queue::{Batch, SearchQueue};
+use crate::macro_solver::search_queue::{Batch, QueueCandidate, SearchQueue};
 use crate::quality_upper_bound_solver::{
     QualityUbSolverShard, QualityUbSolverStats, QualityUbStates,
 };
@@ -18,6 +19,7 @@ use crate::{
     SolverException, SolverSettings, StepLbSolver,
 };
 
+use smallvec::{SmallVec, smallvec};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::vec::Vec;
@@ -137,11 +139,13 @@ impl<'a> MacroSolver<'a> {
     ) -> Self {
         let quality_ub_solver = QualityUbSolver::new(settings, interrupt_signal.clone());
         let step_lb_solver = StepLbSolver::new(settings, interrupt_signal.clone());
+        let mut finish_solver = FinishSolver::new(settings);
+        finish_solver.set_interrupt_signal(interrupt_signal.clone());
         Self {
             settings,
             solution_callback,
             progress_callback,
-            finish_solver: FinishSolver::new(settings),
+            finish_solver,
             quality_ub_solver,
             step_lb_solver,
             interrupt_signal,
@@ -158,6 +162,8 @@ impl<'a> MacroSolver<'a> {
 
     pub fn set_interrupt_signal(&mut self, interrupt_signal: AtomicFlag) {
         self.interrupt_signal = interrupt_signal;
+        self.finish_solver
+            .set_interrupt_signal(self.interrupt_signal.clone());
         self.quality_ub_solver
             .set_interrupt_signal(self.interrupt_signal.clone());
         self.step_lb_solver
@@ -232,6 +238,42 @@ impl<'a> MacroSolver<'a> {
         incumbent_actions: &[Action],
         minimize_steps: bool,
     ) -> Result<MacroSolveOutcome, SolverException> {
+        self.solve_from_state_with_condition_and_lanes_anytime(
+            initial_state,
+            condition,
+            incumbent_actions,
+            minimize_steps,
+            None,
+        )
+    }
+
+    /// Optimize only continuations of the supplied exact progress prefixes. The unrestricted
+    /// root is intentionally excluded; callers must supply a validated completing incumbent.
+    pub fn solve_from_state_with_condition_and_seeded_prefixes_anytime(
+        &mut self,
+        initial_state: SimulationState,
+        condition: Condition,
+        incumbent_actions: &[Action],
+        minimize_steps: bool,
+        prefixes: Vec<Vec<Action>>,
+    ) -> Result<MacroSolveOutcome, SolverException> {
+        self.solve_from_state_with_condition_and_lanes_anytime(
+            initial_state,
+            condition,
+            incumbent_actions,
+            minimize_steps,
+            Some(prefixes),
+        )
+    }
+
+    fn solve_from_state_with_condition_and_lanes_anytime(
+        &mut self,
+        initial_state: SimulationState,
+        condition: Condition,
+        incumbent_actions: &[Action],
+        minimize_steps: bool,
+        seeded_prefixes: Option<Vec<Vec<Action>>>,
+    ) -> Result<MacroSolveOutcome, SolverException> {
         log::debug!(
             "rayon::current_num_threads() = {}",
             rayon::current_num_threads()
@@ -242,63 +284,71 @@ impl<'a> MacroSolver<'a> {
         self.complete_solution_found.store(false, Ordering::Release);
         let _total_time = ScopedTimer::new("Total Time");
 
+        let seeded_only = seeded_prefixes.is_some();
         let mut incumbent = self.incumbent_solution(initial_state, condition, incumbent_actions);
-        let completion = self
-            .progress_frontier_cache
-            .as_ref()
-            .filter(|cache| cache.root == initial_state && cache.condition == condition)
-            .and_then(|cache| cache.completion.clone());
-        let completion = if completion.is_some() {
-            completion
-        } else {
-            let frontier_solver =
-                ProgressFrontierSolver::new(self.settings, self.interrupt_signal.clone());
-            let completion = frontier_solver
-                .solve_with_expansion_limit(
-                    initial_state,
-                    condition,
-                    ProgressTarget::Complete,
-                    ProgressPolicy::Fastest,
-                    Some(100_000),
-                )
-                .into_iter()
-                .next()
-                .map(|endpoint| endpoint.actions);
-            if completion.is_some() {
-                self.progress_frontier_cache = Some(ProgressFrontierCache {
-                    root: initial_state,
-                    condition,
-                    completion: completion.clone(),
-                    one_short_prefixes: Vec::new(),
-                    one_short_attempted: false,
-                });
-            }
-            completion
-        };
-        if let Some(actions) = completion {
+        if !seeded_only {
             let completion = self
-                .incumbent_solution(initial_state, condition, &actions)
-                .expect("progress frontier returned a non-completing endpoint");
-            if incumbent
+                .progress_frontier_cache
                 .as_ref()
-                .is_none_or(|current| completion.score > current.score)
-            {
-                incumbent = Some(completion);
+                .filter(|cache| cache.root == initial_state && cache.condition == condition)
+                .and_then(|cache| cache.completion.clone());
+            let completion = if completion.is_some() {
+                completion
+            } else {
+                let frontier_solver =
+                    ProgressFrontierSolver::new(self.settings, self.interrupt_signal.clone());
+                let completion = frontier_solver
+                    .solve_with_expansion_limit(
+                        initial_state,
+                        condition,
+                        ProgressTarget::Complete,
+                        ProgressPolicy::Fastest,
+                        Some(100_000),
+                    )
+                    .into_iter()
+                    .next()
+                    .map(|endpoint| endpoint.actions);
+                if completion.is_some() {
+                    self.progress_frontier_cache = Some(ProgressFrontierCache {
+                        root: initial_state,
+                        condition,
+                        completion: completion.clone(),
+                        one_short_prefixes: Vec::new(),
+                        one_short_attempted: false,
+                    });
+                }
+                completion
+            };
+            if let Some(actions) = completion {
+                let completion = self
+                    .incumbent_solution(initial_state, condition, &actions)
+                    .expect("progress frontier returned a non-completing endpoint");
+                if incumbent
+                    .as_ref()
+                    .is_none_or(|current| completion.score > current.score)
+                {
+                    incumbent = Some(completion);
+                }
             }
         }
         if incumbent.is_some() {
             self.complete_solution_found.store(true, Ordering::Release);
         }
-        let cached_one_short = self
-            .progress_frontier_cache
-            .as_ref()
-            .filter(|cache| cache.root == initial_state && cache.condition == condition)
-            .filter(|cache| cache.one_short_attempted)
-            .map(|cache| cache.one_short_prefixes.clone());
-        let mut one_short_worker = (cached_one_short.is_none() && !self.interrupt_signal.is_set())
-            .then(|| OneShortWorker::start(self.settings, initial_state, condition));
+        let cached_one_short = (!seeded_only)
+            .then(|| {
+                self.progress_frontier_cache
+                    .as_ref()
+                    .filter(|cache| cache.root == initial_state && cache.condition == condition)
+                    .filter(|cache| cache.one_short_attempted)
+                    .map(|cache| cache.one_short_prefixes.clone())
+            })
+            .flatten();
+        let mut one_short_worker =
+            (!seeded_only && cached_one_short.is_none() && !self.interrupt_signal.is_set())
+                .then(|| OneShortWorker::start(self.settings, initial_state, condition));
         let timer = ScopedTimer::new("Finish Solver");
         if let Err(error) = self.finish_solver.precompute() {
+            self.finish_solver.discard_precompute();
             return self.interrupted_outcome(error, incumbent);
         }
         if condition == Condition::Normal
@@ -344,7 +394,9 @@ impl<'a> MacroSolver<'a> {
                 return self.interrupted_outcome(error, incumbent);
             }
         }
-        let one_short_prefixes = if let Some(prefixes) = cached_one_short {
+        let one_short_prefixes = if let Some(prefixes) = seeded_prefixes {
+            prefixes
+        } else if let Some(prefixes) = cached_one_short {
             prefixes
         } else if self.interrupt_signal.is_set() {
             Vec::new()
@@ -370,6 +422,7 @@ impl<'a> MacroSolver<'a> {
             incumbent,
             one_short_prefixes,
             minimize_steps,
+            !seeded_only,
         )?;
         drop(timer);
 
@@ -456,8 +509,13 @@ impl<'a> MacroSolver<'a> {
         incumbent: Option<Solution>,
         one_short_prefixes: Vec<Vec<Action>>,
         minimize_steps: bool,
+        include_anchor: bool,
     ) -> Result<(Solution, bool, u16), SolverException> {
-        let mut search_queue = SearchQueue::new(self.settings, state, condition);
+        let mut search_queue = if include_anchor {
+            SearchQueue::new(self.settings, state, condition)
+        } else {
+            SearchQueue::seeded(self.settings, state, condition)
+        };
         for prefix in one_short_prefixes {
             let current_steps = u8::try_from(prefix.len()).unwrap_or(u8::MAX);
             let current_duration = prefix.iter().fold(0_u8, |duration, action| {
@@ -508,6 +566,7 @@ impl<'a> MacroSolver<'a> {
 
             let create_worker_data = || WorkerData {
                 settings: &self.settings,
+                interrupt_signal: &self.interrupt_signal,
                 finish_solver: &self.finish_solver,
                 quality_ub_solver_shard: self.quality_ub_solver.create_shard(),
                 step_lb_solver_shard: self.step_lb_solver.create_shard(),
@@ -584,17 +643,22 @@ impl<'a> MacroSolver<'a> {
             if candidate_count >= 4096 {
                 let candidates = worker_results
                     .iter()
-                    .flat_map(|worker| worker.candidate_states.iter().copied())
-                    .filter(|(score, _, _)| *score >= min_accepted_score)
+                    .flat_map(|worker| worker.candidate_states.iter())
+                    .filter(|candidate| candidate.score >= min_accepted_score)
+                    .cloned()
                     .collect();
                 search_queue.push_batch(candidates)?;
             } else {
-                for (score, action, parent_id) in worker_results
+                for candidate in worker_results
                     .iter()
-                    .flat_map(|worker| worker.candidate_states.iter().copied())
-                    .filter(|(score, _, _)| *score >= min_accepted_score)
+                    .flat_map(|worker| worker.candidate_states.iter())
+                    .filter(|candidate| candidate.score >= min_accepted_score)
                 {
-                    search_queue.push(score, action, parent_id)?;
+                    search_queue.push_transition(
+                        candidate.score,
+                        &candidate.actions,
+                        candidate.parent_idx,
+                    )?;
                 }
             }
 
@@ -644,18 +708,19 @@ struct WorkerResult {
     quality_ub_states: QualityUbStates,
     step_lb_states: StepLbStates,
     min_accepted_score: SearchScore,
-    candidate_states: Vec<(SearchScore, ActionCombo, usize)>,
+    candidate_states: Vec<QueueCandidate>,
     best_intermediate_solution: Option<Solution>,
 }
 
 struct WorkerData<'main> {
     settings: &'main SolverSettings,
+    interrupt_signal: &'main AtomicFlag,
     finish_solver: &'main FinishSolver,
     quality_ub_solver_shard: QualityUbSolverShard<'main>,
     step_lb_solver_shard: StepLbSolverShard<'main>,
     search_queue: &'main SearchQueue,
     min_accepted_score: SearchScore,
-    candidate_states: Vec<(SearchScore, ActionCombo, usize)>,
+    candidate_states: Vec<QueueCandidate>,
     best_intermediate_solution: Option<Solution>,
 }
 
@@ -678,7 +743,7 @@ impl WorkerData<'_> {
         &mut self,
         state: SimulationState,
         score: SearchScore,
-        action: ActionCombo,
+        transition_actions: SmallVec<[ActionCombo; 4]>,
         parent_id: usize,
     ) {
         if state.progress >= self.settings.max_progress() {
@@ -688,14 +753,18 @@ impl WorkerData<'_> {
                 .is_none_or(|solution| solution.score < (score, state.quality))
             {
                 let mut actions = self.search_queue.get_actions_from_node_idx(parent_id);
-                actions.push(action);
+                actions.extend_from_slice(&transition_actions);
                 self.best_intermediate_solution = Some(Solution {
                     score: (score, state.quality),
                     solver_actions: actions.into_vec(),
                 });
             }
         } else if score >= self.min_accepted_score {
-            self.candidate_states.push((score, action, parent_id));
+            self.candidate_states.push(QueueCandidate {
+                score,
+                actions: transition_actions,
+                parent_idx: parent_id,
+            });
         }
     }
 
@@ -706,22 +775,65 @@ impl WorkerData<'_> {
         score: SearchScore,
         backtrack_id: usize,
     ) -> Result<(), SolverException> {
-        if condition == Condition::Normal {
-            for action in FULL_SEARCH_ACTIONS {
+        if self.interrupt_signal.is_set() {
+            return Err(SolverException::Interrupted);
+        }
+        let stellar_active = state.effects.stellar_steady_hand() != 0;
+        if !stellar_active && condition == Condition::Normal {
+            for action in FULL_SEARCH_ACTIONS
+                .into_iter()
+                .filter(|action| !action.is_stellar_window_action())
+                .filter(|action| {
+                    *action != ActionCombo::Single(Action::FinalAppraisal)
+                        || !final_appraisal_is_dominated(
+                            self.settings,
+                            state,
+                            Condition::Normal,
+                        )
+                })
+            {
                 if let Ok(state) = use_action_combo(self.settings, state, action) {
-                    self.process_child(state, Condition::Normal, score, action, backtrack_id)?;
+                    self.process_child(
+                        state,
+                        Condition::Normal,
+                        score,
+                        smallvec![action],
+                        backtrack_id,
+                    )?;
                 }
             }
-        } else {
+        } else if !stellar_active {
             // Prefix expansion uses individual actions so zero-step actions and combo transitions
             // consume conditions exactly as the game does. Future random conditions are absent.
-            for action in Action::iter().map(ActionCombo::Single) {
+            for action in Action::iter()
+                .map(ActionCombo::Single)
+                .filter(|action| !action.is_stellar_window_action())
+                .filter(|action| {
+                    *action != ActionCombo::Single(Action::FinalAppraisal)
+                        || !final_appraisal_is_dominated(self.settings, state, condition)
+                })
+            {
                 if let Ok((state, next_condition)) =
                     use_action_combo_with_condition(self.settings, state, action, condition)
                 {
-                    self.process_child(state, next_condition, score, action, backtrack_id)?;
+                    self.process_child(
+                        state,
+                        next_condition,
+                        score,
+                        smallvec![action],
+                        backtrack_id,
+                    )?;
                 }
             }
+        }
+        for transition in stellar_window_transitions(self.settings, state, condition, None) {
+            self.process_child(
+                transition.state,
+                transition.condition,
+                score,
+                transition.actions,
+                backtrack_id,
+            )?;
         }
         Ok(())
     }
@@ -731,11 +843,13 @@ impl WorkerData<'_> {
         state: SimulationState,
         condition: Condition,
         score: SearchScore,
-        action: ActionCombo,
+        actions: SmallVec<[ActionCombo; 4]>,
         backtrack_id: usize,
     ) -> Result<(), SolverException> {
-        let current_steps = score.current_steps + action.steps();
-        let current_duration = score.current_duration + action.duration();
+        let transition_steps = actions.iter().map(|action| action.steps()).sum::<u8>();
+        let transition_duration = actions.iter().map(|action| action.duration()).sum::<u8>();
+        let current_steps = score.current_steps.saturating_add(transition_steps);
+        let current_duration = score.current_duration.saturating_add(transition_duration);
         if state.is_final(&self.settings.simulator_settings) {
             if state.progress >= self.settings.max_progress() {
                 let solution_score = SearchScore {
@@ -746,7 +860,7 @@ impl WorkerData<'_> {
                     current_duration,
                 };
                 self.update_min_score(solution_score);
-                self.add_candidate_state(state, solution_score, action, backtrack_id);
+                self.add_candidate_state(state, solution_score, actions, backtrack_id);
             }
             return Ok(());
         }
@@ -760,7 +874,7 @@ impl WorkerData<'_> {
                 current_steps,
                 current_duration,
             };
-            self.add_candidate_state(state, child_score, action, backtrack_id);
+            self.add_candidate_state(state, child_score, actions, backtrack_id);
             return Ok(());
         }
 
@@ -807,7 +921,7 @@ impl WorkerData<'_> {
             current_steps,
             current_duration,
         };
-        self.add_candidate_state(state, child_score, action, backtrack_id);
+        self.add_candidate_state(state, child_score, actions, backtrack_id);
         Ok(())
     }
 }

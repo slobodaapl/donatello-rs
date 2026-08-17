@@ -52,6 +52,8 @@ impl ReducedState {
         // progress/quality targets. Dropping them is therefore an admissible relaxation.
         effects.set_final_appraisal(0);
         effects.set_careful_observation_charges(0);
+        // The step bound models Normal-condition actions; Cosmic tools differ only on Good.
+        effects.set_splendor_cosmic(false);
 
         // Make the effects of GreatStrides and WasteNot last forever.
         // This decreases the number of unique states as now each effect only has 2 possible states
@@ -157,5 +159,30 @@ mod tests {
             reduced.push(ReducedState::from_state(root, NonZeroU8::new(10).unwrap()));
         }
         assert!(reduced.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[test]
+    fn cosmic_tool_uses_the_normal_condition_step_bound_state() {
+        let settings = Settings {
+            max_cp: 500,
+            max_durability: 40,
+            max_progress: 500,
+            max_quality: 1000,
+            base_progress: 100,
+            base_quality: 100,
+            job_level: 100,
+            allowed_actions: ActionMask::regular(),
+            adversarial: false,
+            backload_progress: false,
+            stellar_steady_hand_charges: 0,
+        };
+        let normal = SimulationState::new(&settings);
+        let mut cosmic = normal;
+        cosmic.effects.set_splendor_cosmic(true);
+        let budget = NonZeroU8::new(10).unwrap();
+        assert_eq!(
+            ReducedState::from_state(normal, budget),
+            ReducedState::from_state(cosmic, budget)
+        );
     }
 }

@@ -236,7 +236,7 @@ fn sturdy_prefix_preserves_a_known_completing_suffix() {
     let mut condition = Condition::Sturdy;
     for action in actions {
         state = state.use_action(action, condition, &settings).unwrap();
-        if action.increases_step_count() {
+        if action.advances_condition() {
             condition = condition.deterministic_successor();
         }
     }
@@ -288,7 +288,7 @@ fn late_sturdy_root_with_no_bound_continuation_preserves_incumbent() {
     let mut condition = Condition::Sturdy;
     for action in result {
         state = state.use_action(action, condition, &settings).unwrap();
-        if action.increases_step_count() {
+        if action.advances_condition() {
             condition = condition.deterministic_successor();
         }
     }

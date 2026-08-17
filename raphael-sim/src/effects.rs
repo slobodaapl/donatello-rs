@@ -65,14 +65,21 @@ impl Effects {
     /// tables and trigger expensive dynamic solving.
     #[must_use]
     pub const fn canonicalize_specialist_resources(self) -> Self {
-        let usable_actions =
-            self.heart_and_soul_available() as u8 + self.quick_innovation_available() as u8;
+        let usable_actions = self.heart_and_soul_available() as u8
+            + self.quick_innovation_available() as u8
+            + self.careful_observation_charges();
         let delineations = if self.crafter_delineations() < usable_actions {
             self.crafter_delineations()
         } else {
             usable_actions
         };
-        let effects = self.with_crafter_delineations(delineations);
+        let effects = self
+            .with_crafter_delineations(delineations)
+            .with_careful_observation_charges(if self.careful_observation_charges() < delineations {
+                self.careful_observation_charges()
+            } else {
+                delineations
+            });
         if delineations == 0 {
             // Heart and Soul may already be active after its delineation was spent.
             effects
@@ -153,6 +160,7 @@ impl Effects {
             .with_innovation(0)
             .with_great_strides(0)
             .with_expedience(false)
+            .with_splendor_cosmic(false)
             .with_quick_innovation_available(false)
             .with_final_appraisal(0)
             .with_careful_observation_charges(0)
@@ -246,5 +254,11 @@ mod specialist_resource_tests {
         assert!(!effects.heart_and_soul_available());
         assert!(!effects.quick_innovation_available());
         assert!(effects.heart_and_soul_active());
+    }
+
+    #[test]
+    fn quality_stripping_removes_cosmic_good_condition_bonus() {
+        let effects = Effects::new().with_splendor_cosmic(true);
+        assert!(!effects.strip_quality_effects().splendor_cosmic());
     }
 }

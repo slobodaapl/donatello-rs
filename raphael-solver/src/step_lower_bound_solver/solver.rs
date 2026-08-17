@@ -2,7 +2,10 @@ use std::num::{NonZero, NonZeroU8};
 
 use crate::{
     SolverException, SolverSettings,
-    actions::{FULL_SEARCH_ACTIONS, use_action_combo},
+    actions::{
+        FULL_SEARCH_ACTIONS, has_stellar_window_resource,
+        remove_stellar_window_from_bound_settings, use_action_combo,
+    },
     macros::internal_error,
     utils::{self, ParetoFrontBuilder, ParetoValue, compute_iq_quality_lut},
 };
@@ -46,8 +49,9 @@ pub struct StepLbSolverShard<'main> {
 
 impl StepLbSolver {
     pub fn new(mut settings: SolverSettings, interrupt_signal: utils::AtomicFlag) -> Self {
-        let iq_quality_lut = compute_iq_quality_lut(&settings);
         settings.simulator_settings.adversarial = false;
+        remove_stellar_window_from_bound_settings(&mut settings.simulator_settings);
+        let iq_quality_lut = compute_iq_quality_lut(&settings);
         ReducedState::optimize_action_mask(&mut settings.simulator_settings);
         Self {
             context: StepLbSolverContext {
@@ -105,6 +109,9 @@ impl StepLbSolver {
     ) -> Result<u8, SolverException> {
         if self.context.interrupt_signal.is_set() {
             return Err(SolverException::Interrupted);
+        }
+        if has_stellar_window_resource(&state) {
+            return Ok(1);
         }
         if !state.effects.quality_actions_allowed()
             && state.quality < self.context.settings.max_quality()
@@ -180,6 +187,9 @@ impl StepLbSolverShard<'_> {
     ) -> Result<u8, SolverException> {
         if self.context.interrupt_signal.is_set() {
             return Err(SolverException::Interrupted);
+        }
+        if has_stellar_window_resource(&state) {
+            return Ok(1);
         }
         if !state.effects.quality_actions_allowed()
             && state.quality < self.context.settings.max_quality()

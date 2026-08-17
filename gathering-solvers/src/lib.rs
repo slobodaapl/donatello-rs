@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 pub enum SolverMode {
     ExpectedScrip,
     Legacy,
+    MaximizeCollectability,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -155,7 +156,8 @@ pub struct SolveRequest {
 pub struct Decision {
     pub action: GatheringAction,
     pub solver_used: SolverMode,
-    pub expected_scrip: f64,
+    pub expected_reward: f64,
+    pub expected_perfect_collects: f64,
     pub expected_terminal_gp: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
@@ -163,33 +165,43 @@ pub struct Decision {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Value {
-    scrip: f64,
+    perfect_collects: f64,
+    reward: f64,
     terminal_gp: f64,
     actions: f64,
 }
 
 impl Value {
-    fn after(self, probability: f64, immediate_scrip: f64) -> Self {
+    fn after(
+        self,
+        probability: f64,
+        immediate_reward: f64,
+        immediate_perfect_collects: f64,
+    ) -> Self {
         Self {
-            scrip: probability * (self.scrip + immediate_scrip),
+            perfect_collects: probability * (self.perfect_collects + immediate_perfect_collects),
+            reward: probability * (self.reward + immediate_reward),
             terminal_gp: probability * self.terminal_gp,
             actions: probability * self.actions,
         }
     }
 
     fn add(&mut self, other: Self) {
-        self.scrip += other.scrip;
+        self.perfect_collects += other.perfect_collects;
+        self.reward += other.reward;
         self.terminal_gp += other.terminal_gp;
         self.actions += other.actions;
     }
 
     fn better_than(self, other: Self) -> bool {
         const EPSILON: f64 = 1e-9;
-        self.scrip > other.scrip + EPSILON
-            || ((self.scrip - other.scrip).abs() <= EPSILON
-                && (self.terminal_gp > other.terminal_gp + EPSILON
-                    || ((self.terminal_gp - other.terminal_gp).abs() <= EPSILON
-                        && self.actions < other.actions - EPSILON)))
+        self.perfect_collects > other.perfect_collects + EPSILON
+            || ((self.perfect_collects - other.perfect_collects).abs() <= EPSILON
+                && (self.reward > other.reward + EPSILON
+                    || ((self.reward - other.reward).abs() <= EPSILON
+                        && (self.terminal_gp > other.terminal_gp + EPSILON
+                            || ((self.terminal_gp - other.terminal_gp).abs() <= EPSILON
+                                && self.actions < other.actions - EPSILON)))))
     }
 }
 
@@ -198,15 +210,18 @@ pub fn solve(request: &SolveRequest) -> Result<Decision, String> {
     if request.mode == SolverMode::Legacy {
         return legacy_decision(request, None);
     }
-    if let Some(reason) = &request.unsupported_reason {
+    if request.mode == SolverMode::ExpectedScrip
+        && let Some(reason) = &request.unsupported_reason
+    {
         return legacy_decision(request, Some(reason.clone()));
     }
 
     match ExpectedSolver::new(request).solve() {
         Ok((action, value)) => Ok(Decision {
             action,
-            solver_used: SolverMode::ExpectedScrip,
-            expected_scrip: value.scrip,
+            solver_used: request.mode,
+            expected_reward: value.reward,
+            expected_perfect_collects: value.perfect_collects,
             expected_terminal_gp: value.terminal_gp,
             fallback_reason: None,
         }),
@@ -341,7 +356,8 @@ fn legacy_result(
     Ok(Decision {
         action,
         solver_used: SolverMode::Legacy,
-        expected_scrip: 0.0,
+        expected_reward: 0.0,
+        expected_perfect_collects: 0.0,
         expected_terminal_gp: 0.0,
         fallback_reason,
     })
@@ -384,7 +400,7 @@ impl<'a> ExpectedSolver<'a> {
             return Ok(*value);
         }
         if self.memo.len() as u32 >= self.request.mechanics.max_states {
-            return Err(String::from("expected-scrip search budget exceeded"));
+            return Err(String::from("gathering solver search budget exceeded"));
         }
         if !self.visiting.insert(state) {
             return Err(String::from("cyclic transition kernel"));
@@ -408,9 +424,9 @@ impl<'a> ExpectedSolver<'a> {
         for action in ACTION_ORDER {
             if let Some(outcomes) = self.outcomes(state, action) {
                 let mut value = Value::default();
-                for (probability, successor, reward) in outcomes {
+                for (probability, successor, reward, perfect_collects) in outcomes {
                     let successor_value = self.value(successor)?;
-                    value.add(successor_value.after(probability, reward));
+                    value.add(successor_value.after(probability, reward, perfect_collects));
                 }
                 value.actions += 1.0;
                 result.push((action, value));
@@ -419,9 +435,16 @@ impl<'a> ExpectedSolver<'a> {
         Ok(result)
     }
 
-    fn outcomes(&self, state: State, action: GatheringAction) -> Option<Vec<(f64, State, f64)>> {
+    fn outcomes(
+        &self,
+        state: State,
+        action: GatheringAction,
+    ) -> Option<Vec<(f64, State, f64, f64)>> {
         match action {
-            GatheringAction::Collect if self.reward(state.collectability) > 0 => {
+            GatheringAction::Collect
+                if self.request.mode == SolverMode::MaximizeCollectability
+                    || self.reward(state.collectability) > 0 =>
+            {
                 Some(self.collect_outcomes(state))
             }
             GatheringAction::Scour
@@ -491,7 +514,7 @@ impl<'a> ExpectedSolver<'a> {
                 let mut next = state;
                 next.gp -= self.request.actions.scrutiny_cost;
                 next.scrutiny = true;
-                Some(vec![(1.0, next, 0.0)])
+                Some(vec![(1.0, next, 0.0, 0.0)])
             }
             GatheringAction::CollectorsFocus
                 if self.request.actions.collectors_focus
@@ -501,7 +524,7 @@ impl<'a> ExpectedSolver<'a> {
                 let mut next = state;
                 next.gp -= self.request.actions.focus_cost;
                 next.collectors_focus = true;
-                Some(vec![(1.0, next, 0.0)])
+                Some(vec![(1.0, next, 0.0, 0.0)])
             }
             GatheringAction::PrimingTouch
                 if self.request.actions.priming_touch
@@ -511,7 +534,7 @@ impl<'a> ExpectedSolver<'a> {
                 let mut next = state;
                 next.gp -= self.request.actions.priming_cost;
                 next.priming_touch = true;
-                Some(vec![(1.0, next, 0.0)])
+                Some(vec![(1.0, next, 0.0, 0.0)])
             }
             GatheringAction::SolidReason
                 if self.request.actions.solid_reason
@@ -538,7 +561,7 @@ impl<'a> ExpectedSolver<'a> {
                 let mut next = state;
                 next.eureka = false;
                 next.integrity += 1;
-                Some(vec![(1.0, next, 0.0)])
+                Some(vec![(1.0, next, 0.0, 0.0)])
             }
             _ => None,
         }
@@ -549,7 +572,7 @@ impl<'a> ExpectedSolver<'a> {
         state: State,
         gains: impl IntoIterator<Item = (u16, f64)>,
         meticulous: bool,
-    ) -> Vec<(f64, State, f64)> {
+    ) -> Vec<(f64, State, f64, f64)> {
         let mechanics = self.request.mechanics;
         let intuition_bp = if state.collectors_focus {
             mechanics.focus_intuition_bp
@@ -623,6 +646,7 @@ impl<'a> ExpectedSolver<'a> {
                                     * high_probability,
                                 next,
                                 0.0,
+                                0.0,
                             ));
                         }
                     }
@@ -632,9 +656,16 @@ impl<'a> ExpectedSolver<'a> {
         merge_outcomes(outcomes)
     }
 
-    fn collect_outcomes(&self, state: State) -> Vec<(f64, State, f64)> {
+    fn collect_outcomes(&self, state: State) -> Vec<(f64, State, f64, f64)> {
         let success_probability = probability(self.request.mechanics.gather_success_bp);
         let reward = f64::from(self.reward(state.collectability));
+        let perfect_collects = if self.request.mode == SolverMode::MaximizeCollectability
+            && state.collectability == 1000
+        {
+            1.0
+        } else {
+            0.0
+        };
         let mut outcomes = Vec::new();
         for (gather_probability, success) in [
             (success_probability, true),
@@ -675,21 +706,32 @@ impl<'a> ExpectedSolver<'a> {
                         gather_probability * revisit_probability,
                         revisited,
                         if success { reward } else { 0.0 },
+                        if success { perfect_collects } else { 0.0 },
                     ));
                     outcomes.push((
                         gather_probability * (1.0 - revisit_probability),
                         next,
                         if success { reward } else { 0.0 },
+                        if success { perfect_collects } else { 0.0 },
                     ));
                     continue;
                 }
             }
-            outcomes.push((gather_probability, next, if success { reward } else { 0.0 }));
+            outcomes.push((
+                gather_probability,
+                next,
+                if success { reward } else { 0.0 },
+                if success { perfect_collects } else { 0.0 },
+            ));
         }
         merge_outcomes(outcomes)
     }
 
     fn reward(&self, collectability: u16) -> u16 {
+        if self.request.mode == SolverMode::MaximizeCollectability {
+            return collectability;
+        }
+
         self.request
             .rewards
             .iter()
@@ -699,6 +741,10 @@ impl<'a> ExpectedSolver<'a> {
     }
 
     fn appraisal_useful(&self, state: State) -> bool {
+        if self.request.mode == SolverMode::MaximizeCollectability {
+            return state.collectability < 1000;
+        }
+
         self.request
             .rewards
             .last()
@@ -751,21 +797,37 @@ fn probability_branches(bp: u16) -> Vec<(f64, bool)> {
     }
 }
 
-fn binary_outcomes(bp: u16, success: State, failure: State) -> Vec<(f64, State, f64)> {
+fn binary_outcomes(bp: u16, success: State, failure: State) -> Vec<(f64, State, f64, f64)> {
     probability_branches(bp)
         .into_iter()
-        .map(|(probability, branch)| (probability, if branch { success } else { failure }, 0.0))
+        .map(|(probability, branch)| {
+            (
+                probability,
+                if branch { success } else { failure },
+                0.0,
+                0.0,
+            )
+        })
         .collect()
 }
 
-fn merge_outcomes(outcomes: Vec<(f64, State, f64)>) -> Vec<(f64, State, f64)> {
-    let mut merged: HashMap<(State, u64), f64> = HashMap::new();
-    for (probability, state, reward) in outcomes {
-        *merged.entry((state, reward.to_bits())).or_default() += probability;
+fn merge_outcomes(outcomes: Vec<(f64, State, f64, f64)>) -> Vec<(f64, State, f64, f64)> {
+    let mut merged: HashMap<(State, u64, u64), f64> = HashMap::new();
+    for (probability, state, reward, perfect_collects) in outcomes {
+        *merged
+            .entry((state, reward.to_bits(), perfect_collects.to_bits()))
+            .or_default() += probability;
     }
     merged
         .into_iter()
-        .map(|((state, reward), probability)| (probability, state, f64::from_bits(reward)))
+        .map(|((state, reward, perfect_collects), probability)| {
+            (
+                probability,
+                state,
+                f64::from_bits(reward),
+                f64::from_bits(perfect_collects),
+            )
+        })
         .collect()
 }
 
@@ -846,7 +908,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(decision.action, GatheringAction::Scour);
-        assert!((decision.expected_scrip - 120.0).abs() < 1e-9);
+        assert!((decision.expected_reward - 120.0).abs() < 1e-9);
     }
 
     #[test]
@@ -863,7 +925,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(decision.action, GatheringAction::Scour);
-        assert!((decision.expected_scrip - 100.0).abs() < 1e-9);
+        assert!((decision.expected_reward - 100.0).abs() < 1e-9);
     }
 
     #[test]
@@ -881,11 +943,47 @@ mod tests {
         let without_preservation = solve(&input).unwrap();
         assert_eq!(decision.action, GatheringAction::Meticulous);
         assert!(
-            decision.expected_scrip > without_preservation.expected_scrip,
+            decision.expected_reward > without_preservation.expected_reward,
             "with={} without={}",
-            decision.expected_scrip,
-            without_preservation.expected_scrip
+            decision.expected_reward,
+            without_preservation.expected_reward
         );
+    }
+
+    #[test]
+    fn maximize_collectability_prefers_a_perfect_collect_over_two_lower_collects() {
+        let mut input = request(vec![RewardTier {
+            threshold: 500,
+            scrip: 1,
+        }]);
+        input.mode = SolverMode::MaximizeCollectability;
+        input.state.collectability = 500;
+        input.state.integrity = 3;
+        input.state.max_integrity = 3;
+        input.state.remaining = 2;
+        let decision = solve(&input).unwrap();
+        assert_eq!(decision.action, GatheringAction::Scour);
+        assert!((decision.expected_perfect_collects - 1.0).abs() < 1e-9);
+        assert!((decision.expected_reward - 1000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn maximize_collectability_collects_the_best_available_subcap_result() {
+        let mut input = request(vec![RewardTier {
+            threshold: 500,
+            scrip: 1,
+        }]);
+        input.mode = SolverMode::MaximizeCollectability;
+        input.state.collectability = 700;
+        input.state.integrity = 1;
+        input.state.max_integrity = 1;
+        input.state.remaining = 1;
+        input.unsupported_reason = Some(String::from("aetherial reduction collectable"));
+        let decision = solve(&input).unwrap();
+        assert_eq!(decision.solver_used, SolverMode::MaximizeCollectability);
+        assert_eq!(decision.action, GatheringAction::Collect);
+        assert_eq!(decision.expected_perfect_collects, 0.0);
+        assert!((decision.expected_reward - 700.0).abs() < 1e-9);
     }
 
     #[test]

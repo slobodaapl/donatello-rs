@@ -102,14 +102,14 @@ fn main() {
         ),
     ];
 
-    println!("profile,gp,expected_scrip,expected_terminal_gp,first_action,fallback");
+    println!("profile,gp,expected_reward,expected_terminal_gp,first_action,fallback");
     for (profile, rewards) in profiles {
         for gp in (0..=1_000).step_by(8) {
             let decision =
                 solve(&request(gp, rewards.clone())).expect("representative solve failed");
             println!(
                 "{profile},{gp},{:.6},{:.6},{:?},{}",
-                decision.expected_scrip,
+                decision.expected_reward,
                 decision.expected_terminal_gp,
                 decision.action,
                 decision.fallback_reason.as_deref().unwrap_or("")

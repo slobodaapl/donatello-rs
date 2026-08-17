@@ -263,6 +263,7 @@ const fn action_name_en(action: Action) -> &'static str {
         Action::HastyTouch => "Hasty Touch",
         Action::DaringTouch => "Daring Touch",
         Action::FinalAppraisal => "Final Appraisal",
+        Action::CarefulObservation => "Careful Observation",
     }
 }
 
@@ -304,6 +305,7 @@ const fn action_name_de(action: Action) -> &'static str {
         Action::HastyTouch => "Hastige Veredelung",
         Action::DaringTouch => "Kühne Veredelung",
         Action::FinalAppraisal => "Abschließende Kontrolle",
+        Action::CarefulObservation => "Sorgfältige Beobachtung",
     }
 }
 
@@ -345,6 +347,7 @@ const fn action_name_fr(action: Action) -> &'static str {
         Action::HastyTouch => "Ouvrage hâtif",
         Action::DaringTouch => "Ouvrage audacieux",
         Action::FinalAppraisal => "Dernière vérification",
+        Action::CarefulObservation => "Observation attentive",
     }
 }
 
@@ -386,6 +389,7 @@ const fn action_name_jp(action: Action) -> &'static str {
         Action::HastyTouch => "ヘイスティタッチ",
         Action::DaringTouch => "デアリングタッチ",
         Action::FinalAppraisal => "最終確認",
+        Action::CarefulObservation => "設計変更",
     }
 }
 
@@ -427,6 +431,7 @@ const fn action_name_cn(action: Action) -> &'static str {
         Action::HastyTouch => "仓促",
         Action::DaringTouch => "冒进",
         Action::FinalAppraisal => "最终确认",
+        Action::CarefulObservation => "设计变动",
     }
 }
 
@@ -468,6 +473,7 @@ const fn action_name_kr(action: Action) -> &'static str {
         Action::HastyTouch => "성급한 손길",
         Action::DaringTouch => "대담한 손길",
         Action::FinalAppraisal => "최종 확인",
+        Action::CarefulObservation => "설계 변경",
     }
 }
 
@@ -509,5 +515,6 @@ const fn action_name_tw(action: Action) -> &'static str {
         Action::HastyTouch => "倉促",
         Action::DaringTouch => "冒進",
         Action::FinalAppraisal => "最終確認",
+        Action::CarefulObservation => "設計變更",
     }
 }

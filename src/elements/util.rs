@@ -244,5 +244,6 @@ pub fn get_action_icon(action: Action, job_id: u8) -> egui::Image<'static> {
         Action::RapidSynthesis => action_icon!("Rapid Synthesis", job_id),
         Action::HastyTouch => action_icon!("Hasty Touch", job_id),
         Action::DaringTouch => action_icon!("Daring Touch", job_id),
+        Action::CarefulObservation => action_icon!("Careful Observation", job_id),
     })
 }

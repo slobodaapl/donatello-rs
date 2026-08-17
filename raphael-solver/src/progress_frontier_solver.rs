@@ -3,8 +3,12 @@ use std::collections::BinaryHeap;
 
 use raphael_sim::{Action, Condition, Effects, SimulationState};
 use rustc_hash::FxHashMap;
+use smallvec::{SmallVec, smallvec};
 
-use crate::{AtomicFlag, SolverSettings};
+use crate::{
+    AtomicFlag, SolverSettings,
+    actions::{final_appraisal_is_dominated, stellar_window_transitions},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgressTarget {
@@ -52,7 +56,7 @@ struct Label {
     state: SimulationState,
     condition: Condition,
     parent: Option<usize>,
-    action: Option<Action>,
+    actions: SmallVec<[Action; 4]>,
     advancing_steps: u16,
     action_count: u16,
     duration: u16,
@@ -92,7 +96,7 @@ impl ProgressFrontierSolver {
         self.solve_with_expansion_limit(root, condition, target, policy, None)
     }
 
-    pub(crate) fn solve_with_expansion_limit(
+    pub fn solve_with_expansion_limit(
         &self,
         root: SimulationState,
         condition: Condition,
@@ -104,7 +108,7 @@ impl ProgressFrontierSolver {
             state: root,
             condition,
             parent: None,
-            action: None,
+            actions: SmallVec::new(),
             advancing_steps: 0,
             action_count: 0,
             duration: 0,
@@ -150,32 +154,95 @@ impl ProgressFrontierSolver {
                 continue;
             }
 
-            for &action in actions(target) {
-                let parent = &labels[label_index];
-                let Ok(state) = parent.state.use_action(
-                    action,
-                    parent.condition,
-                    &self.settings.simulator_settings,
-                ) else {
-                    continue;
-                };
-                let condition = if action.increases_step_count() {
-                    parent.condition.deterministic_successor()
-                } else {
-                    parent.condition
-                };
-                let action_count = parent.action_count.saturating_add(1);
-                let duration = parent
-                    .duration
-                    .saturating_add(u16::from(action.time_cost()));
-                let advancing_steps = parent
-                    .advancing_steps
-                    .saturating_add(u16::from(state.progress > parent.state.progress));
+            let parent_state = labels[label_index].state;
+            let parent_condition = labels[label_index].condition;
+            let parent_action_count = labels[label_index].action_count;
+            let parent_duration = labels[label_index].duration;
+            let parent_advancing_steps = labels[label_index].advancing_steps;
+            let stellar_active = parent_state.effects.stellar_steady_hand() != 0;
+            let mut transitions = Vec::new();
+            if !stellar_active {
+                for &action in actions(target) {
+                    if matches!(
+                        action,
+                        Action::StellarSteadyHand
+                            | Action::RapidSynthesis
+                            | Action::HastyTouch
+                            | Action::DaringTouch
+                    ) {
+                        continue;
+                    }
+                    if action == Action::FinalAppraisal
+                        && final_appraisal_is_dominated(
+                            &self.settings,
+                            parent_state,
+                            parent_condition,
+                        )
+                    {
+                        continue;
+                    }
+                    let Ok(state) = parent_state.use_action(
+                        action,
+                        parent_condition,
+                        &self.settings.simulator_settings,
+                    ) else {
+                        continue;
+                    };
+                    let condition = if action.advances_condition() {
+                        parent_condition.deterministic_successor()
+                    } else {
+                        parent_condition
+                    };
+                    transitions.push((
+                        state,
+                        condition,
+                        smallvec![action],
+                        u16::from(state.progress > parent_state.progress),
+                    ));
+                }
+            }
+            let stop_progress = Some(match target {
+                ProgressTarget::Complete => self.settings.max_progress(),
+                ProgressTarget::OneShort => self.settings.max_progress().saturating_sub(1),
+            });
+            transitions.extend(
+                stellar_window_transitions(
+                    &self.settings,
+                    parent_state,
+                    parent_condition,
+                    stop_progress,
+                )
+                .into_iter()
+                .map(|transition| {
+                    let actions: SmallVec<[Action; 4]> = transition
+                        .actions
+                        .iter()
+                        .flat_map(|action| action.actions().iter().copied())
+                        .collect();
+                    (
+                        transition.state,
+                        transition.condition,
+                        actions,
+                        transition.advancing_steps,
+                    )
+                }),
+            );
+            for (state, condition, actions, transition_advancing_steps) in transitions {
+                let action_count = parent_action_count
+                    .saturating_add(u16::try_from(actions.len()).unwrap_or(u16::MAX));
+                let duration = parent_duration.saturating_add(
+                    actions
+                        .iter()
+                        .map(|action| u16::from(action.time_cost()))
+                        .sum(),
+                );
+                let advancing_steps =
+                    parent_advancing_steps.saturating_add(transition_advancing_steps);
                 let candidate = Label {
                     state,
                     condition,
                     parent: Some(label_index),
-                    action: Some(action),
+                    actions,
                     advancing_steps,
                     action_count,
                     duration,
@@ -252,7 +319,7 @@ fn maximum_progress_increase(settings: &SolverSettings) -> u16 {
 fn reconstruct(labels: &[Label], mut index: usize) -> Vec<Action> {
     let mut result = Vec::new();
     while let Some(parent) = labels[index].parent {
-        result.push(labels[index].action.unwrap());
+        result.extend(labels[index].actions.iter().rev());
         index = parent;
     }
     result.reverse();
@@ -380,6 +447,40 @@ mod tests {
     }
 
     #[test]
+    fn stellar_completion_is_reconstructed_and_stops_when_craft_finishes() {
+        let mut settings = settings();
+        settings.simulator_settings.max_progress = 1000;
+        settings.simulator_settings.allowed_actions = ActionMask::none()
+            .add(Action::StellarSteadyHand)
+            .add(Action::RapidSynthesis)
+            .add(Action::HastyTouch)
+            .add(Action::DaringTouch);
+        settings.simulator_settings.stellar_steady_hand_charges = 1;
+        let root = SimulationState::new(&settings.simulator_settings);
+        let endpoint = ProgressFrontierSolver::new(settings, AtomicFlag::new())
+            .solve(
+                root,
+                Condition::Normal,
+                ProgressTarget::Complete,
+                ProgressPolicy::Fastest,
+            )
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(
+            endpoint.actions,
+            [
+                Action::StellarSteadyHand,
+                Action::RapidSynthesis,
+                Action::RapidSynthesis,
+            ]
+        );
+        assert_eq!(endpoint.action_count, 3);
+        assert_eq!(endpoint.duration, 8);
+        assert!(endpoint.state.progress >= settings.max_progress());
+    }
+
+    #[test]
     fn one_short_uses_final_appraisal_clamp_without_zero_step_cycles() {
         let mut settings = settings();
         settings.simulator_settings.max_progress = 150;
@@ -399,6 +500,26 @@ mod tests {
                 && endpoint.actions.contains(&Action::FinalAppraisal)
                 && endpoint.action_count == endpoint.actions.len() as u16
         }));
+    }
+
+    #[test]
+    fn one_short_does_not_waste_final_appraisal_when_basic_synthesis_already_finishes() {
+        let mut settings = settings();
+        settings.simulator_settings.max_progress = 150;
+        settings.simulator_settings.allowed_actions = ActionMask::none()
+            .add(Action::BasicSynthesis)
+            .add(Action::FinalAppraisal);
+        let mut root = SimulationState::new(&settings.simulator_settings);
+        root.progress = 50;
+
+        let endpoints = ProgressFrontierSolver::new(settings, AtomicFlag::new()).solve(
+            root,
+            Condition::Normal,
+            ProgressTarget::OneShort,
+            ProgressPolicy::Pareto,
+        );
+
+        assert!(endpoints.is_empty());
     }
 
     #[test]

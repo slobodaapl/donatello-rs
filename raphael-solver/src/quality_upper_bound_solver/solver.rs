@@ -1,6 +1,8 @@
 use crate::{
     SolverException, SolverSettings,
-    actions::FULL_SEARCH_ACTIONS,
+    actions::{
+        FULL_SEARCH_ACTIONS, has_stellar_window_resource, remove_stellar_window_from_bound_settings,
+    },
     macros::internal_error,
     utils::{self, ParetoFrontBuilder, ParetoValue},
 };
@@ -54,6 +56,7 @@ pub struct QualityUbSolverShard<'main> {
 
 impl QualityUbSolver {
     pub fn new(mut settings: SolverSettings, interrupt_signal: utils::AtomicFlag) -> Self {
+        remove_stellar_window_from_bound_settings(&mut settings.simulator_settings);
         let durability_cost = durability_cost(&settings.simulator_settings);
         settings.simulator_settings.max_cp = {
             let initial_state = SimulationState::new(&settings.simulator_settings);
@@ -442,6 +445,9 @@ impl QualityUbSolverShard<'_> {
         &mut self,
         mut state: SimulationState,
     ) -> Result<u16, SolverException> {
+        if has_stellar_window_resource(&state) {
+            return Ok(self.context.settings.max_quality());
+        }
         let mut required_progress = self.context.settings.max_progress() - state.progress;
         if state.effects.muscle_memory() != 0 {
             // Assume MuscleMemory can be used to its max potential and remove the effect to reduce the number of states that need to be solved.
@@ -515,6 +521,9 @@ impl QualityUbSolverShard<'_> {
         &mut self,
         mut state: SimulationState,
     ) -> Result<u16, SolverException> {
+        if has_stellar_window_resource(&state) {
+            return Ok(self.context.settings.max_quality());
+        }
         let mut required_progress = self.context.settings.max_progress() - state.progress;
         if state.effects.muscle_memory() != 0 {
             required_progress =

@@ -1,4 +1,3 @@
-#[cfg(test)]
 use std::cmp::Reverse;
 use std::collections::VecDeque;
 use std::ffi::{CString, c_char};
@@ -16,7 +15,7 @@ use raphael_solver::{
 };
 use serde::{Deserialize, Serialize};
 
-const ABI_VERSION: u32 = 7;
+const ABI_VERSION: u32 = 10;
 const DEFAULT_CACHE_BUDGET: usize = 512 * 1024 * 1024;
 
 type CachedSolver = Arc<Mutex<MacroSolver<'static>>>;
@@ -52,9 +51,13 @@ struct CraftSolveRequest {
     manipulation: bool,
     specialist: bool,
     #[serde(default)]
+    allow_careful_observation: bool,
+    #[serde(default)]
     solve_mode: u8,
     #[serde(default)]
     minimize_steps: bool,
+    #[serde(default)]
+    progress_first: bool,
     #[serde(default)]
     stellar_steady_hand_charges: u8,
     #[serde(default)]
@@ -170,7 +173,7 @@ fn condition(value: u8) -> Result<Condition, String> {
     }
 }
 
-fn build_state(root: &RootState) -> Result<SimulationState, String> {
+fn build_state(root: &RootState, allow_careful_observation: bool) -> Result<SimulationState, String> {
     let combo = match root.combo {
         0 => Combo::None,
         1 => Combo::BasicTouch,
@@ -188,7 +191,11 @@ fn build_state(root: &RootState) -> Result<SimulationState, String> {
         .with_great_strides(root.great_strides)
         .with_muscle_memory(root.muscle_memory)
         .with_final_appraisal(root.final_appraisal)
-        .with_careful_observation_charges(root.careful_observation_charges)
+        .with_careful_observation_charges(if allow_careful_observation {
+            root.careful_observation_charges.min(3)
+        } else {
+            0
+        })
         .with_combo(combo)
         .with_heart_and_soul_active(root.heart_and_soul_active)
         .with_heart_and_soul_available(root.heart_and_soul_available)
@@ -200,7 +207,7 @@ fn build_state(root: &RootState) -> Result<SimulationState, String> {
         .with_splendor_cosmic(root.splendor_cosmic)
         .with_expedience(root.expedience);
     let effects = effects
-        .with_crafter_delineations(root.crafter_delineations.min(2))
+        .with_crafter_delineations(root.crafter_delineations.min(5))
         .canonicalize_specialist_resources();
     Ok(SimulationState {
         cp: root.cp,
@@ -224,16 +231,24 @@ fn solve(request: CraftSolveRequest, interrupt: AtomicFlag) -> Result<SolveResul
     if request.solve_mode > 2 {
         return Err(format!("unsupported solve mode {}", request.solve_mode));
     }
-    let state = build_state(&request.root)?;
+    let current_condition = condition(request.root.condition)?;
+    let allow_careful_observation = request.allow_careful_observation
+        && request.specialist
+        && request.solve_mode != 1
+        && current_condition == Condition::Poor;
+    let state = build_state(&request.root, allow_careful_observation)?;
     let mut allowed_actions = if request.solve_mode == 1 {
         progress_only_actions()
     } else {
         ActionMask::regular().add(Action::FinalAppraisal)
     };
-    if request.stellar_steady_hand_charges > 0 {
-        allowed_actions = allowed_actions
-            .add(Action::StellarSteadyHand)
-            .add(Action::RapidSynthesis);
+    if request.stellar_steady_hand_charges > 0 || request.root.stellar_steady_hand > 0 {
+        allowed_actions = allowed_actions.add(Action::RapidSynthesis);
+        if request.stellar_steady_hand_charges > 0 {
+            allowed_actions = allowed_actions.add(Action::StellarSteadyHand);
+        } else {
+            allowed_actions = allowed_actions.remove(Action::StellarSteadyHand);
+        }
         if request.solve_mode != 1 {
             allowed_actions = allowed_actions
                 .add(Action::HastyTouch)
@@ -253,6 +268,9 @@ fn solve(request: CraftSolveRequest, interrupt: AtomicFlag) -> Result<SolveResul
         allowed_actions = allowed_actions
             .add(Action::HeartAndSoul)
             .add(Action::QuickInnovation);
+        if allow_careful_observation {
+            allowed_actions = allowed_actions.add(Action::CarefulObservation);
+        }
     }
     if !state.effects.heart_and_soul_available() {
         allowed_actions = allowed_actions.remove(Action::HeartAndSoul);
@@ -273,7 +291,6 @@ fn solve(request: CraftSolveRequest, interrupt: AtomicFlag) -> Result<SolveResul
         backload_progress: false,
         stellar_steady_hand_charges: request.stellar_steady_hand_charges.min(3),
     };
-    let current_condition = condition(request.root.condition)?;
     let incumbent = request
         .incumbent_action_ids
         .into_iter()
@@ -343,21 +360,25 @@ fn solve(request: CraftSolveRequest, interrupt: AtomicFlag) -> Result<SolveResul
     );
     let result = match request.solve_mode {
         1 => solve_completion(solver_settings, state, current_condition, interrupt.clone()),
-        2 => solver
-            .solve_from_state_with_condition_and_incumbent_anytime(
+        2 if request.progress_first
+            && state.progress < solver_settings.max_progress().saturating_sub(1) =>
+        {
+            solve_staged_progress(
+                &mut solver,
+                solver_settings,
                 state,
                 current_condition,
-                &incumbent,
                 request.minimize_steps,
+                interrupt.clone(),
             )
-            .map(|outcome| SolvePlan {
-                actions: outcome.actions,
-                optimal: outcome.optimal,
-                quality: outcome.quality,
-                quality_upper_bound: outcome.quality_upper_bound,
-                progress_boundary: None,
-            })
-            .map_err(|error| format!("{error:?}")),
+        }
+        2 => solve_macro(
+            &mut solver,
+            state,
+            current_condition,
+            &incumbent,
+            request.minimize_steps,
+        ),
         _ => solver
             .solve_from_state_with_condition_and_incumbent_anytime(
                 state,
@@ -398,6 +419,214 @@ fn solve(request: CraftSolveRequest, interrupt: AtomicFlag) -> Result<SolveResul
     })
 }
 
+fn solve_macro(
+    solver: &mut MacroSolver<'_>,
+    state: SimulationState,
+    condition: Condition,
+    incumbent: &[Action],
+    minimize_steps: bool,
+) -> Result<SolvePlan, String> {
+    solver
+        .solve_from_state_with_condition_and_incumbent_anytime(
+            state,
+            condition,
+            incumbent,
+            minimize_steps,
+        )
+        .map(|outcome| SolvePlan {
+            actions: outcome.actions,
+            optimal: outcome.optimal,
+            quality: outcome.quality,
+            quality_upper_bound: outcome.quality_upper_bound,
+            progress_boundary: None,
+        })
+        .map_err(|error| format!("{error:?}"))
+}
+
+#[derive(Clone)]
+struct StagedPrefix {
+    state: SimulationState,
+    condition: Condition,
+    actions: Vec<Action>,
+}
+
+fn solve_staged_progress(
+    solver: &mut MacroSolver<'_>,
+    settings: SolverSettings,
+    state: SimulationState,
+    condition: Condition,
+    minimize_steps: bool,
+    interrupt: AtomicFlag,
+) -> Result<SolvePlan, String> {
+    let mut prefixes = Vec::new();
+    if let Some(endpoint) = ProgressFrontierSolver::new(settings, interrupt.clone())
+        .solve(
+            state,
+            condition,
+            ProgressTarget::OneShort,
+            ProgressPolicy::Fastest,
+        )
+        .into_iter()
+        .next()
+    {
+        prefixes.push(StagedPrefix {
+            state: endpoint.state,
+            condition: endpoint.condition,
+            actions: endpoint.actions,
+        });
+    }
+
+    if matches!(condition, Condition::Good | Condition::Excellent) && !interrupt.is_set() {
+        for action in QUALITY_REACTION_ACTIONS {
+            if action.success_rate(&state, condition) < 100 {
+                continue;
+            }
+            let Ok(detour_state) =
+                state.use_action(action, condition, &settings.simulator_settings)
+            else {
+                continue;
+            };
+            if detour_state.progress != state.progress
+                || (detour_state.quality <= state.quality && detour_state.cp <= state.cp)
+            {
+                continue;
+            }
+            let detour_condition = if action.advances_condition() {
+                condition.deterministic_successor()
+            } else {
+                condition
+            };
+            let Some(endpoint) = ProgressFrontierSolver::new(settings, interrupt.clone())
+                .solve(
+                    detour_state,
+                    detour_condition,
+                    ProgressTarget::OneShort,
+                    ProgressPolicy::Fastest,
+                )
+                .into_iter()
+                .next()
+            else {
+                continue;
+            };
+            let mut actions = Vec::with_capacity(endpoint.actions.len() + 1);
+            actions.push(action);
+            actions.extend(endpoint.actions);
+            prefixes.push(StagedPrefix {
+                state: endpoint.state,
+                condition: endpoint.condition,
+                actions,
+            });
+        }
+    }
+
+    if !interrupt.is_set() {
+        prefixes.extend(
+            ProgressFrontierSolver::new(settings, interrupt.clone())
+                .solve_with_expansion_limit(
+                    state,
+                    condition,
+                    ProgressTarget::OneShort,
+                    ProgressPolicy::Pareto,
+                    Some(100),
+                )
+                .into_iter()
+                .map(|endpoint| StagedPrefix {
+                    state: endpoint.state,
+                    condition: endpoint.condition,
+                    actions: endpoint.actions,
+                }),
+        );
+    }
+    prefixes.sort_unstable_by_key(|prefix| {
+        prefix
+            .actions
+            .iter()
+            .map(|action| *action as u8)
+            .collect::<Vec<_>>()
+    });
+    prefixes.dedup_by(|left, right| left.actions == right.actions);
+
+    let mut completing = prefixes
+        .iter()
+        .filter_map(|prefix| {
+            let finish = finishing_action(settings, prefix.state, prefix.condition)?;
+            let mut actions = prefix.actions.clone();
+            actions.push(finish);
+            Some(actions)
+        })
+        .collect::<Vec<_>>();
+    completing.sort_unstable_by_key(|actions| {
+        plan_score(&settings.simulator_settings, state, condition, actions)
+    });
+    let incumbent = completing.pop().ok_or_else(|| String::from("NoSolution"))?;
+    let seeded_actions = prefixes
+        .iter()
+        .map(|prefix| prefix.actions.clone())
+        .collect::<Vec<_>>();
+    let outcome = solver
+        .solve_from_state_with_condition_and_seeded_prefixes_anytime(
+            state,
+            condition,
+            &incumbent,
+            minimize_steps,
+            seeded_actions.clone(),
+        )
+        .map_err(|error| format!("{error:?}"))?;
+    let boundary = seeded_actions
+        .iter()
+        .filter(|prefix| outcome.actions.starts_with(prefix))
+        .map(Vec::len)
+        .max()
+        .ok_or_else(|| String::from("staged solver escaped the progress frontier"))?;
+    Ok(SolvePlan {
+        actions: outcome.actions,
+        optimal: outcome.optimal,
+        quality: outcome.quality,
+        quality_upper_bound: outcome.quality_upper_bound,
+        progress_boundary: Some(ProgressBoundary {
+            action_count: boundary,
+            target: "oneShort",
+        }),
+    })
+}
+
+const QUALITY_REACTION_ACTIONS: [Action; 12] = [
+    Action::BasicTouch,
+    Action::TricksOfTheTrade,
+    Action::StandardTouch,
+    Action::ByregotsBlessing,
+    Action::PreciseTouch,
+    Action::PrudentTouch,
+    Action::AdvancedTouch,
+    Action::Reflect,
+    Action::PreparatoryTouch,
+    Action::TrainedFinesse,
+    Action::RefinedTouch,
+    Action::TrainedEye,
+];
+
+fn finishing_action(
+    settings: SolverSettings,
+    state: SimulationState,
+    condition: Condition,
+) -> Option<Action> {
+    const ACTIONS: [Action; 8] = [
+        Action::BasicSynthesis,
+        Action::CarefulSynthesis,
+        Action::Groundwork,
+        Action::DelicateSynthesis,
+        Action::IntensiveSynthesis,
+        Action::PrudentSynthesis,
+        Action::MuscleMemory,
+        Action::RapidSynthesis,
+    ];
+    ACTIONS.into_iter().find(|action| {
+        state
+            .use_action(*action, condition, &settings.simulator_settings)
+            .is_ok_and(|next| next.progress >= settings.max_progress())
+    })
+}
+
 struct SolvePlan {
     actions: Vec<Action>,
     optimal: bool,
@@ -434,7 +663,6 @@ fn solve_completion(
     })
 }
 
-#[cfg(test)]
 fn plan_score(
     settings: &Settings,
     mut state: SimulationState,
@@ -456,7 +684,7 @@ fn plan_score(
         };
         state = next;
         duration = duration.saturating_add(u16::from(action.time_cost()));
-        if action.increases_step_count() {
+        if action.advances_condition() {
             condition = condition.deterministic_successor();
         }
     }
@@ -530,7 +758,7 @@ fn evaluate_final_state(
             break;
         };
         state = next;
-        condition = if action.increases_step_count() {
+        condition = if action.advances_condition() {
             condition.deterministic_successor()
         } else {
             condition
@@ -921,7 +1149,7 @@ mod tests {
 
     fn request(condition: u8) -> Vec<u8> {
         format!(
-            r#"{{"abiVersion":7,"maxCp":500,"maxDurability":40,"maxProgress":500,"maxQuality":500,"baseProgress":100,"baseQuality":100,"jobLevel":100,"manipulation":true,"specialist":false,"solveMode":0,"minimizeSteps":false,"stellarSteadyHandCharges":0,"root":{{"cp":500,"durability":40,"progress":0,"quality":0,"innerQuiet":0,"wasteNot":0,"manipulation":0,"innovation":0,"veneration":0,"greatStrides":0,"muscleMemory":0,"finalAppraisal":0,"carefulObservationCharges":0,"combo":3,"heartAndSoulActive":false,"heartAndSoulAvailable":false,"quickInnovationAvailable":false,"trainedPerfectionActive":false,"trainedPerfectionAvailable":true,"stellarSteadyHandCharges":0,"stellarSteadyHand":0,"expedience":false,"condition":{condition},"crafterDelineations":0}}}}"#
+            r#"{{"abiVersion":10,"maxCp":500,"maxDurability":40,"maxProgress":500,"maxQuality":500,"baseProgress":100,"baseQuality":100,"jobLevel":100,"manipulation":true,"specialist":false,"solveMode":0,"progressFirst":false,"minimizeSteps":false,"stellarSteadyHandCharges":0,"root":{{"cp":500,"durability":40,"progress":0,"quality":0,"innerQuiet":0,"wasteNot":0,"manipulation":0,"innovation":0,"veneration":0,"greatStrides":0,"muscleMemory":0,"finalAppraisal":0,"carefulObservationCharges":0,"combo":3,"heartAndSoulActive":false,"heartAndSoulAvailable":false,"quickInnovationAvailable":false,"trainedPerfectionActive":false,"trainedPerfectionAvailable":true,"stellarSteadyHandCharges":0,"stellarSteadyHand":0,"expedience":false,"condition":{condition},"crafterDelineations":0}}}}"#
         )
         .into_bytes()
     }
@@ -936,6 +1164,31 @@ mod tests {
     #[test]
     fn accepts_robust_condition() {
         assert_eq!(condition(10).unwrap(), Condition::Robust);
+    }
+
+    #[test]
+    fn poor_live_replan_can_select_careful_observation_only_when_enabled() {
+        let mut enabled: CraftSolveRequest = serde_json::from_slice(&request(3)).unwrap();
+        enabled.specialist = true;
+        enabled.allow_careful_observation = true;
+        enabled.solve_mode = 2;
+        enabled.max_quality = 5_000;
+        enabled.root.careful_observation_charges = 1;
+        enabled.root.crafter_delineations = 1;
+        let result = solve(enabled, AtomicFlag::new()).expect("Poor specialist solve must succeed");
+        assert_eq!(
+            result.action_ids.first().copied(),
+            Some(Action::CarefulObservation.action_id())
+        );
+
+        let mut disabled: CraftSolveRequest = serde_json::from_slice(&request(3)).unwrap();
+        disabled.specialist = true;
+        disabled.solve_mode = 2;
+        disabled.max_quality = 5_000;
+        disabled.root.careful_observation_charges = 1;
+        disabled.root.crafter_delineations = 1;
+        let result = solve(disabled, AtomicFlag::new()).expect("disabled Poor solve must succeed");
+        assert!(!result.action_ids.contains(&Action::CarefulObservation.action_id()));
     }
 
     #[test]
@@ -1096,6 +1349,94 @@ mod tests {
     }
 
     #[test]
+    fn normal_live_adaptive_plan_reaches_one_short_before_quality_search() {
+        let mut request: CraftSolveRequest = serde_json::from_slice(&request(0)).unwrap();
+        request.solve_mode = 2;
+        request.progress_first = true;
+        let settings = Settings {
+            max_cp: request.max_cp,
+            max_durability: request.max_durability,
+            max_progress: request.max_progress,
+            max_quality: request.max_quality,
+            base_progress: request.base_progress,
+            base_quality: request.base_quality,
+            job_level: request.job_level,
+            allowed_actions: ActionMask::regular().add(Action::FinalAppraisal),
+            adversarial: false,
+            backload_progress: false,
+            stellar_steady_hand_charges: 0,
+        };
+        let root = build_state(&request.root, false).unwrap();
+        let result = solve(request, AtomicFlag::new()).expect("normal staged solve must complete");
+        let boundary = result
+            .progress_boundary
+            .expect("normal live solve must expose its one-short boundary");
+        assert_eq!(boundary.target, "oneShort");
+        let actions = result
+            .action_ids
+            .iter()
+            .map(|id| Action::from_action_id(*id).unwrap())
+            .collect::<Vec<_>>();
+        assert!(boundary.action_count < actions.len());
+        assert!(
+            actions[..boundary.action_count]
+                .iter()
+                .all(|action| progress_only_actions().has(*action)),
+            "normal progress phase contained a quality-only action: {actions:?}"
+        );
+        let prefix_state = evaluate_final_state(
+            &settings,
+            root,
+            Condition::Normal,
+            &actions[..boundary.action_count],
+        );
+        assert_eq!(prefix_state.progress, settings.max_progress - 1);
+        assert!(result.final_state.complete);
+    }
+
+    #[test]
+    fn good_condition_may_take_quality_reaction_then_rejoins_one_short() {
+        let mut request: CraftSolveRequest = serde_json::from_slice(&request(1)).unwrap();
+        request.solve_mode = 2;
+        request.progress_first = true;
+        let settings = Settings {
+            max_cp: request.max_cp,
+            max_durability: request.max_durability,
+            max_progress: request.max_progress,
+            max_quality: request.max_quality,
+            base_progress: request.base_progress,
+            base_quality: request.base_quality,
+            job_level: request.job_level,
+            allowed_actions: ActionMask::regular().add(Action::FinalAppraisal),
+            adversarial: false,
+            backload_progress: false,
+            stellar_steady_hand_charges: 0,
+        };
+        let root = build_state(&request.root, false).unwrap();
+        let result = solve(request, AtomicFlag::new()).expect("Good staged solve must complete");
+        let boundary = result
+            .progress_boundary
+            .expect("Good solve must rejoin one-short");
+        let actions = result
+            .action_ids
+            .iter()
+            .map(|id| Action::from_action_id(*id).unwrap())
+            .collect::<Vec<_>>();
+        let first = root
+            .use_action(actions[0], Condition::Good, &settings)
+            .expect("returned reaction must be legal");
+        assert!(first.quality > root.quality || first.cp > root.cp);
+        let prefix_state = evaluate_final_state(
+            &settings,
+            root,
+            Condition::Good,
+            &actions[..boundary.action_count],
+        );
+        assert_eq!(prefix_state.progress, settings.max_progress - 1);
+        assert!(result.final_state.complete);
+    }
+
+    #[test]
     fn cosmic_specialist_expert_replans_after_every_condition_change() {
         let settings = Settings {
             max_cp: 600,
@@ -1152,7 +1493,9 @@ mod tests {
                 job_level: 100,
                 manipulation: true,
                 specialist: true,
+                allow_careful_observation: false,
                 solve_mode: 2,
+                progress_first: false,
                 minimize_steps: false,
                 stellar_steady_hand_charges: 0,
                 incumbent_action_ids: Vec::new(),
@@ -1198,7 +1541,7 @@ mod tests {
 
     #[test]
     fn abi_version_is_stable() {
-        assert_eq!(donatello_abi_version(), 7);
+        assert_eq!(donatello_abi_version(), 10);
     }
 
     #[test]
@@ -1207,7 +1550,7 @@ mod tests {
         request.root.crafter_delineations = 1;
         request.root.heart_and_soul_available = true;
         request.root.quick_innovation_available = true;
-        let state = build_state(&request.root).unwrap();
+        let state = build_state(&request.root, true).unwrap();
         assert_eq!(state.effects.crafter_delineations(), 1);
     }
 
@@ -1218,7 +1561,7 @@ mod tests {
         request.root.heart_and_soul_available = true;
         request.root.quick_innovation_available = true;
         request.root.heart_and_soul_active = true;
-        let state = build_state(&request.root).unwrap();
+        let state = build_state(&request.root, false).unwrap();
         assert_eq!(state.effects.crafter_delineations(), 0);
         assert!(!state.effects.heart_and_soul_available());
         assert!(!state.effects.quick_innovation_available());
@@ -1227,7 +1570,7 @@ mod tests {
         request.root.crafter_delineations = 7;
         request.root.heart_and_soul_available = true;
         request.root.quick_innovation_available = false;
-        let state = build_state(&request.root).unwrap();
+        let state = build_state(&request.root, false).unwrap();
         assert_eq!(state.effects.crafter_delineations(), 1);
     }
 
@@ -1250,10 +1593,102 @@ mod tests {
     }
 
     #[test]
+    fn makeshift_gravity_generator_returns_a_completion_within_the_hard_deadline() {
+        let mut request: CraftSolveRequest = serde_json::from_slice(&request(0)).unwrap();
+        request.max_cp = 573;
+        request.max_durability = 70;
+        request.max_progress = 9700;
+        request.max_quality = 17_300;
+        request.base_progress = 298;
+        request.base_quality = 300;
+        request.stellar_steady_hand_charges = 1;
+        request.root.cp = 573;
+        request.root.durability = 70;
+        request.root.stellar_steady_hand_charges = 1;
+        request.soft_deadline_millis = 2_000;
+        request.hard_deadline_millis = 2_000;
+        request.bypass_solution_cache = true;
+
+        let result = solve(request, AtomicFlag::new()).expect("Stellar solve must complete");
+        assert!(!result.action_ids.is_empty());
+        assert!(
+            result.final_state.progress >= 9700,
+            "final progress: {}",
+            result.final_state.progress
+        );
+        assert!(
+            result.elapsed_millis <= 6_000,
+            "2 s hard deadline was not observed promptly: {} ms",
+            result.elapsed_millis
+        );
+    }
+
+    #[test]
+    fn cosmic_oddweight_azurite_optimizes_quality_instead_of_returning_safety_only() {
+        let mut request: CraftSolveRequest = serde_json::from_slice(&request(0)).unwrap();
+        request.max_cp = 591;
+        request.max_durability = 70;
+        request.max_progress = 2300;
+        request.max_quality = 24_700;
+        request.base_progress = 307;
+        request.base_quality = 312;
+        request.specialist = true;
+        request.root.cp = 591;
+        request.root.durability = 70;
+        request.root.heart_and_soul_available = true;
+        request.root.quick_innovation_available = true;
+        request.root.crafter_delineations = 92;
+        request.root.splendor_cosmic = true;
+        request.soft_deadline_millis = 10_000;
+        request.hard_deadline_millis = 10_000;
+        request.bypass_solution_cache = true;
+
+        let result = solve(request, AtomicFlag::new()).expect("Cosmic solve must complete");
+        assert!(result.final_state.complete);
+        assert!(
+            result.final_state.quality > 0,
+            "Cosmic bound-key miss returned only the progress safety plan"
+        );
+        assert!(
+            result.elapsed_millis <= 12_000,
+            "10 s hard deadline was not observed promptly: {} ms",
+            result.elapsed_millis
+        );
+    }
+
+    #[test]
+    fn active_stellar_window_replan_keeps_followup_actions_without_an_unused_charge() {
+        let mut request: CraftSolveRequest = serde_json::from_slice(&request(0)).unwrap();
+        request.solve_mode = 2;
+        request.stellar_steady_hand_charges = 0;
+        request.root.stellar_steady_hand_charges = 0;
+        request.root.stellar_steady_hand = 3;
+        request.root.condition = Condition::Excellent as u8;
+        request.soft_deadline_millis = 100;
+        request.hard_deadline_millis = 1_000;
+        request.bypass_solution_cache = true;
+
+        let result = solve(request, AtomicFlag::new()).expect("active Stellar replan must solve");
+        let actions = result
+            .action_ids
+            .iter()
+            .filter_map(|action| Action::from_action_id(*action))
+            .collect::<Vec<_>>();
+        assert!(!actions.contains(&Action::StellarSteadyHand));
+        assert!(actions.iter().any(|action| {
+            matches!(
+                action,
+                Action::RapidSynthesis | Action::HastyTouch | Action::DaringTouch
+            )
+        }));
+        assert!(result.final_state.progress >= 500);
+    }
+
+    #[test]
     fn progressed_root_preserves_quality_actions() {
         let mut request: CraftSolveRequest = serde_json::from_slice(&request(0)).unwrap();
         request.root.progress = 1;
-        let state = build_state(&request.root).unwrap();
+        let state = build_state(&request.root, false).unwrap();
         assert!(state.effects.quality_actions_allowed());
     }
 
@@ -1284,7 +1719,7 @@ mod tests {
         request.root.stellar_steady_hand = 3;
         request.root.splendor_cosmic = true;
 
-        let state = build_state(&request.root).unwrap();
+        let state = build_state(&request.root, true).unwrap();
         assert_eq!(state.cp, 237);
         assert_eq!(state.durability, 17);
         assert_eq!(state.progress, 123);
@@ -1297,7 +1732,7 @@ mod tests {
         assert_eq!(state.effects.great_strides(), 2);
         assert_eq!(state.effects.muscle_memory(), 1);
         assert_eq!(state.effects.final_appraisal(), 7);
-        assert_eq!(state.effects.careful_observation_charges(), 2);
+        assert_eq!(state.effects.careful_observation_charges(), 0);
         assert_eq!(state.effects.combo(), Combo::BasicTouch);
         assert!(state.effects.heart_and_soul_active());
         assert!(!state.effects.heart_and_soul_available());

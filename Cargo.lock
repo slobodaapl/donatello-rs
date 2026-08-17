@@ -1085,6 +1085,7 @@ dependencies = [
 name = "donatello-bench"
 version = "0.1.0"
 dependencies = [
+ "donatello-ffi",
  "raphael-data",
  "raphael-sim",
  "raphael-solver",

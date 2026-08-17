@@ -71,6 +71,32 @@ fn step_lower_bound_unreachable_quality_no_panic() {
     assert_eq!(result, u8::MAX);
 }
 
+#[test]
+fn stellar_resource_root_uses_the_one_action_optimistic_relaxation() {
+    let settings = SolverSettings {
+        simulator_settings: Settings {
+            max_cp: 500,
+            max_durability: 40,
+            max_progress: 500,
+            max_quality: 1000,
+            base_progress: 100,
+            base_quality: 100,
+            job_level: 100,
+            allowed_actions: REGULAR_ACTIONS,
+            adversarial: false,
+            backload_progress: false,
+            stellar_steady_hand_charges: 1,
+        },
+        allow_non_max_quality_solutions: true,
+    };
+    let mut solver = StepLbSolver::new(settings, AtomicFlag::default());
+    let mut root = SimulationState::new(&settings.simulator_settings);
+    assert_eq!(solver.step_lower_bound(root, 20).unwrap(), 1);
+    root.effects.set_stellar_steady_hand_charges(0);
+    root.effects.set_stellar_steady_hand(2);
+    assert_eq!(solver.step_lower_bound(root, 20).unwrap(), 1);
+}
+
 #[test_case::test_matrix(
     [20, 35, 60, 80],
     [REGULAR_ACTIONS, NO_MANIPULATION, WITH_SPECIALIST_ACTIONS]

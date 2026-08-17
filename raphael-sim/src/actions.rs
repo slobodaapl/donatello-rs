@@ -13,6 +13,8 @@ pub trait ActionImpl {
     const ACTION_MASK: ActionMask;
     /// Does this action increase the step count when used?
     const INCREASES_STEP_COUNT: bool = true;
+    /// Does this zero-step action preserve effect durations that normally tick on zero-step actions?
+    const PRESERVES_EFFECT_DURATIONS: bool = false;
 
     const EFFECT_RESET_MASK: Effects;
     const EFFECT_SET_MASK: Effects;
@@ -896,6 +898,42 @@ impl ActionImpl for HeartAndSoul {
     }
 }
 
+pub struct CarefulObservation {}
+impl ActionImpl for CarefulObservation {
+    const LEVEL_REQUIREMENT: u8 = 55;
+    const ACTION_MASK: ActionMask = ActionMask::none().add(Action::CarefulObservation);
+    const INCREASES_STEP_COUNT: bool = false;
+    const PRESERVES_EFFECT_DURATIONS: bool = true;
+
+    const EFFECT_RESET_MASK: Effects = Effects::from_bits(u64::MAX);
+    const EFFECT_SET_MASK: Effects = Effects::new();
+
+    fn precondition(
+        state: &SimulationState,
+        _settings: &Settings,
+        condition: Condition,
+    ) -> Result<(), ActionError> {
+        if condition != Condition::Poor {
+            Err(ActionError::SpecialConditionNotMet)
+        } else if state.effects.careful_observation_charges() == 0
+            || state.effects.crafter_delineations() == 0
+        {
+            Err(ActionError::NoRemainingUses)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn transform(state: &mut SimulationState, _settings: &Settings, _condition: Condition) {
+        state.effects.set_careful_observation_charges(
+            state.effects.careful_observation_charges().saturating_sub(1),
+        );
+        state
+            .effects
+            .set_crafter_delineations(state.effects.crafter_delineations().saturating_sub(1));
+    }
+}
+
 pub struct PrudentSynthesis {}
 impl ActionImpl for PrudentSynthesis {
     const LEVEL_REQUIREMENT: u8 = 88;
@@ -1298,6 +1336,7 @@ pub enum Action {
     HastyTouch,
     DaringTouch,
     FinalAppraisal,
+    CarefulObservation,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -1385,7 +1424,12 @@ impl Action {
             Self::HastyTouch => HastyTouch::INCREASES_STEP_COUNT,
             Self::DaringTouch => DaringTouch::INCREASES_STEP_COUNT,
             Self::FinalAppraisal => FinalAppraisal::INCREASES_STEP_COUNT,
+            Self::CarefulObservation => CarefulObservation::INCREASES_STEP_COUNT,
         }
+    }
+
+    pub const fn advances_condition(self) -> bool {
+        self.increases_step_count() || matches!(self, Self::CarefulObservation)
     }
 
     pub const fn time_cost(self) -> u8 {
@@ -1426,6 +1470,7 @@ impl Action {
             Self::HastyTouch => 3,
             Self::DaringTouch => 3,
             Self::FinalAppraisal => 3,
+            Self::CarefulObservation => 3,
         }
     }
 
@@ -1467,6 +1512,7 @@ impl Action {
             Self::HastyTouch => 100355,
             Self::DaringTouch => 100451,
             Self::FinalAppraisal => 19012,
+            Self::CarefulObservation => 100395,
         }
     }
 
@@ -1508,6 +1554,7 @@ impl Action {
             100355 => Self::HastyTouch,
             100451 => Self::DaringTouch,
             19012 => Self::FinalAppraisal,
+            100395 => Self::CarefulObservation,
             _ => return None,
         })
     }

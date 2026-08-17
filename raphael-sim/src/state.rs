@@ -163,7 +163,7 @@ impl SimulationState {
                 state.durability = std::cmp::min(settings.max_durability, state.durability + 5);
             }
             state.effects = state.effects.tick_down();
-        } else if state.effects.stellar_steady_hand() != 0 {
+        } else if !A::PRESERVES_EFFECT_DURATIONS && state.effects.stellar_steady_hand() != 0 {
             state
                 .effects
                 .set_stellar_steady_hand(state.effects.stellar_steady_hand().saturating_sub(1));
@@ -288,6 +288,9 @@ impl SimulationState {
             Action::HastyTouch => self.use_action_impl::<HastyTouch>(settings, condition),
             Action::DaringTouch => self.use_action_impl::<DaringTouch>(settings, condition),
             Action::FinalAppraisal => self.use_action_impl::<FinalAppraisal>(settings, condition),
+            Action::CarefulObservation => {
+                self.use_action_impl::<CarefulObservation>(settings, condition)
+            }
         }
     }
 }
@@ -321,6 +324,49 @@ mod tests {
             .use_action(Action::FinalAppraisal, Condition::Normal, &settings)
             .unwrap();
         assert_eq!(state.effects.stellar_steady_hand(), 2);
+    }
+
+    #[test]
+    fn careful_observation_preserves_effects_and_consumes_shared_resources() {
+        let settings = Settings {
+            max_cp: 500,
+            max_durability: 40,
+            max_progress: 100,
+            max_quality: 1000,
+            base_progress: 10,
+            base_quality: 10,
+            job_level: 100,
+            allowed_actions: ActionMask::all(),
+            adversarial: false,
+            backload_progress: false,
+            stellar_steady_hand_charges: 1,
+        };
+        let mut state = SimulationState::new(&settings);
+        state.effects = state
+            .effects
+            .with_inner_quiet(3)
+            .with_innovation(2)
+            .with_stellar_steady_hand(2)
+            .with_expedience(true)
+            .with_combo(Combo::BasicTouch)
+            .with_careful_observation_charges(2)
+            .with_crafter_delineations(4)
+            .canonicalize_specialist_resources();
+
+        let observed = state
+            .use_action(Action::CarefulObservation, Condition::Poor, &settings)
+            .unwrap();
+        assert_eq!(observed.effects.inner_quiet(), 3);
+        assert_eq!(observed.effects.innovation(), 2);
+        assert_eq!(observed.effects.stellar_steady_hand(), 2);
+        assert!(observed.effects.expedience());
+        assert_eq!(observed.effects.combo(), Combo::BasicTouch);
+        assert_eq!(observed.effects.careful_observation_charges(), 1);
+        assert_eq!(observed.effects.crafter_delineations(), 3);
+        assert_eq!(
+            state.use_action(Action::CarefulObservation, Condition::Normal, &settings),
+            Err(ActionError::SpecialConditionNotMet)
+        );
     }
 
     #[test]

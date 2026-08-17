@@ -63,6 +63,7 @@ impl ActionMask {
             .remove(Action::HeartAndSoul)
             .remove(Action::QuickInnovation)
             .remove(Action::FinalAppraisal)
+            .remove(Action::CarefulObservation)
     }
 
     pub const fn has(self, action: Action) -> bool {

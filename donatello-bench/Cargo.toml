@@ -6,7 +6,8 @@ edition = "2024"
 [dependencies]
 raphael-sim = { workspace = true, features = ["serde"] }
 raphael-solver = { workspace = true }
-raphael-data = { workspace = true }
+raphael-data = { workspace = true, features = ["serde"] }
+donatello-ffi = { path = "../donatello-ffi" }
 serde = { workspace = true }
 serde_json = "1.0"
 
