@@ -87,6 +87,15 @@ impl SimulationState {
         settings: &Settings,
         condition: Condition,
     ) -> Result<Self, ActionError> {
+        self.use_action_impl_with_outcome::<A>(settings, condition, true)
+    }
+
+    fn use_action_impl_with_outcome<A: ActionImpl>(
+        &self,
+        settings: &Settings,
+        condition: Condition,
+        succeeded: bool,
+    ) -> Result<Self, ActionError> {
         self.check_common_preconditions::<A>(settings, condition)?;
         A::precondition(self, settings, condition)?;
 
@@ -100,7 +109,11 @@ impl SimulationState {
 
         state.cp -= A::cp_cost(self, settings, condition);
 
-        let quality_increase = A::quality_increase(self, settings, condition);
+        let quality_increase = if succeeded {
+            A::quality_increase(self, settings, condition)
+        } else {
+            0
+        };
         if settings.adversarial {
             let guard_active = state.effects.adversarial_guard_active();
             if quality_increase != 0 {
@@ -130,9 +143,12 @@ impl SimulationState {
                 .set_inner_quiet(std::cmp::min(10, state.effects.inner_quiet() + 1));
         }
 
-        let progress_increase = match condition {
-            Condition::Malleable => A::progress_increase(self, settings).saturating_mul(3) / 2,
-            _ => A::progress_increase(self, settings),
+        let progress_increase = match (succeeded, condition) {
+            (true, Condition::Malleable) => {
+                A::progress_increase(self, settings).saturating_mul(3) / 2
+            }
+            (true, _) => A::progress_increase(self, settings),
+            (false, _) => 0,
         };
         state.progress = state.progress.saturating_add(progress_increase);
 
@@ -169,10 +185,11 @@ impl SimulationState {
                 .set_stellar_steady_hand(state.effects.stellar_steady_hand().saturating_sub(1));
         }
 
-        A::transform(&mut state, settings, condition);
-
-        state.effects =
-            Effects::from_bits(state.effects.into_bits() | A::EFFECT_SET_MASK.into_bits());
+        if succeeded {
+            A::transform(&mut state, settings, condition);
+            state.effects =
+                Effects::from_bits(state.effects.into_bits() | A::EFFECT_SET_MASK.into_bits());
+        }
 
         if condition == Condition::Primed {
             let set = A::EFFECT_SET_MASK;
@@ -233,64 +250,123 @@ impl SimulationState {
         condition: Condition,
         settings: &Settings,
     ) -> Result<Self, ActionError> {
+        if action.success_rate(self, condition) < 100 {
+            return Err(ActionError::UnreliableAction);
+        }
+        self.use_action_with_outcome(action, condition, settings, true)
+    }
+
+    /// Applies one already-rolled action outcome. Unlike [`Self::use_action`], this accepts
+    /// unreliable actions and models both their success and failure branches.
+    pub fn use_action_with_outcome(
+        &self,
+        action: Action,
+        condition: Condition,
+        settings: &Settings,
+        succeeded: bool,
+    ) -> Result<Self, ActionError> {
         match action {
-            Action::BasicSynthesis => self.use_action_impl::<BasicSynthesis>(settings, condition),
-            Action::BasicTouch => self.use_action_impl::<BasicTouch>(settings, condition),
-            Action::MasterMend => self.use_action_impl::<MasterMend>(settings, condition),
-            Action::Observe => self.use_action_impl::<Observe>(settings, condition),
-            Action::TricksOfTheTrade => {
-                self.use_action_impl::<TricksOfTheTrade>(settings, condition)
+            Action::BasicSynthesis => {
+                self.use_action_impl_with_outcome::<BasicSynthesis>(settings, condition, succeeded)
             }
-            Action::WasteNot => self.use_action_impl::<WasteNot>(settings, condition),
-            Action::Veneration => self.use_action_impl::<Veneration>(settings, condition),
-            Action::StandardTouch => self.use_action_impl::<StandardTouch>(settings, condition),
-            Action::GreatStrides => self.use_action_impl::<GreatStrides>(settings, condition),
-            Action::Innovation => self.use_action_impl::<Innovation>(settings, condition),
-            Action::WasteNot2 => self.use_action_impl::<WasteNot2>(settings, condition),
-            Action::ByregotsBlessing => {
-                self.use_action_impl::<ByregotsBlessing>(settings, condition)
+            Action::BasicTouch => {
+                self.use_action_impl_with_outcome::<BasicTouch>(settings, condition, succeeded)
             }
-            Action::PreciseTouch => self.use_action_impl::<PreciseTouch>(settings, condition),
-            Action::MuscleMemory => self.use_action_impl::<MuscleMemory>(settings, condition),
-            Action::CarefulSynthesis => {
-                self.use_action_impl::<CarefulSynthesis>(settings, condition)
+            Action::MasterMend => {
+                self.use_action_impl_with_outcome::<MasterMend>(settings, condition, succeeded)
             }
-            Action::Manipulation => self.use_action_impl::<Manipulation>(settings, condition),
-            Action::PrudentTouch => self.use_action_impl::<PrudentTouch>(settings, condition),
-            Action::AdvancedTouch => self.use_action_impl::<AdvancedTouch>(settings, condition),
-            Action::Reflect => self.use_action_impl::<Reflect>(settings, condition),
-            Action::PreparatoryTouch => {
-                self.use_action_impl::<PreparatoryTouch>(settings, condition)
+            Action::Observe => {
+                self.use_action_impl_with_outcome::<Observe>(settings, condition, succeeded)
             }
-            Action::Groundwork => self.use_action_impl::<Groundwork>(settings, condition),
-            Action::DelicateSynthesis => {
-                self.use_action_impl::<DelicateSynthesis>(settings, condition)
+            Action::TricksOfTheTrade => self
+                .use_action_impl_with_outcome::<TricksOfTheTrade>(settings, condition, succeeded),
+            Action::WasteNot => {
+                self.use_action_impl_with_outcome::<WasteNot>(settings, condition, succeeded)
             }
-            Action::IntensiveSynthesis => {
-                self.use_action_impl::<IntensiveSynthesis>(settings, condition)
+            Action::Veneration => {
+                self.use_action_impl_with_outcome::<Veneration>(settings, condition, succeeded)
             }
-            Action::TrainedEye => self.use_action_impl::<TrainedEye>(settings, condition),
-            Action::HeartAndSoul => self.use_action_impl::<HeartAndSoul>(settings, condition),
-            Action::PrudentSynthesis => {
-                self.use_action_impl::<PrudentSynthesis>(settings, condition)
+            Action::StandardTouch => {
+                self.use_action_impl_with_outcome::<StandardTouch>(settings, condition, succeeded)
             }
-            Action::TrainedFinesse => self.use_action_impl::<TrainedFinesse>(settings, condition),
-            Action::RefinedTouch => self.use_action_impl::<RefinedTouch>(settings, condition),
-            Action::QuickInnovation => self.use_action_impl::<QuickInnovation>(settings, condition),
-            Action::ImmaculateMend => self.use_action_impl::<ImmaculateMend>(settings, condition),
-            Action::TrainedPerfection => {
-                self.use_action_impl::<TrainedPerfection>(settings, condition)
+            Action::GreatStrides => {
+                self.use_action_impl_with_outcome::<GreatStrides>(settings, condition, succeeded)
             }
-            Action::StellarSteadyHand => {
-                self.use_action_impl::<StellarSteadyHand>(settings, condition)
+            Action::Innovation => {
+                self.use_action_impl_with_outcome::<Innovation>(settings, condition, succeeded)
             }
-            Action::RapidSynthesis => self.use_action_impl::<RapidSynthesis>(settings, condition),
-            Action::HastyTouch => self.use_action_impl::<HastyTouch>(settings, condition),
-            Action::DaringTouch => self.use_action_impl::<DaringTouch>(settings, condition),
-            Action::FinalAppraisal => self.use_action_impl::<FinalAppraisal>(settings, condition),
-            Action::CarefulObservation => {
-                self.use_action_impl::<CarefulObservation>(settings, condition)
+            Action::WasteNot2 => {
+                self.use_action_impl_with_outcome::<WasteNot2>(settings, condition, succeeded)
             }
+            Action::ByregotsBlessing => self
+                .use_action_impl_with_outcome::<ByregotsBlessing>(settings, condition, succeeded),
+            Action::PreciseTouch => {
+                self.use_action_impl_with_outcome::<PreciseTouch>(settings, condition, succeeded)
+            }
+            Action::MuscleMemory => {
+                self.use_action_impl_with_outcome::<MuscleMemory>(settings, condition, succeeded)
+            }
+            Action::CarefulSynthesis => self
+                .use_action_impl_with_outcome::<CarefulSynthesis>(settings, condition, succeeded),
+            Action::Manipulation => {
+                self.use_action_impl_with_outcome::<Manipulation>(settings, condition, succeeded)
+            }
+            Action::PrudentTouch => {
+                self.use_action_impl_with_outcome::<PrudentTouch>(settings, condition, succeeded)
+            }
+            Action::AdvancedTouch => {
+                self.use_action_impl_with_outcome::<AdvancedTouch>(settings, condition, succeeded)
+            }
+            Action::Reflect => {
+                self.use_action_impl_with_outcome::<Reflect>(settings, condition, succeeded)
+            }
+            Action::PreparatoryTouch => self
+                .use_action_impl_with_outcome::<PreparatoryTouch>(settings, condition, succeeded),
+            Action::Groundwork => {
+                self.use_action_impl_with_outcome::<Groundwork>(settings, condition, succeeded)
+            }
+            Action::DelicateSynthesis => self
+                .use_action_impl_with_outcome::<DelicateSynthesis>(settings, condition, succeeded),
+            Action::IntensiveSynthesis => self
+                .use_action_impl_with_outcome::<IntensiveSynthesis>(settings, condition, succeeded),
+            Action::TrainedEye => {
+                self.use_action_impl_with_outcome::<TrainedEye>(settings, condition, succeeded)
+            }
+            Action::HeartAndSoul => {
+                self.use_action_impl_with_outcome::<HeartAndSoul>(settings, condition, succeeded)
+            }
+            Action::PrudentSynthesis => self
+                .use_action_impl_with_outcome::<PrudentSynthesis>(settings, condition, succeeded),
+            Action::TrainedFinesse => {
+                self.use_action_impl_with_outcome::<TrainedFinesse>(settings, condition, succeeded)
+            }
+            Action::RefinedTouch => {
+                self.use_action_impl_with_outcome::<RefinedTouch>(settings, condition, succeeded)
+            }
+            Action::QuickInnovation => {
+                self.use_action_impl_with_outcome::<QuickInnovation>(settings, condition, succeeded)
+            }
+            Action::ImmaculateMend => {
+                self.use_action_impl_with_outcome::<ImmaculateMend>(settings, condition, succeeded)
+            }
+            Action::TrainedPerfection => self
+                .use_action_impl_with_outcome::<TrainedPerfection>(settings, condition, succeeded),
+            Action::StellarSteadyHand => self
+                .use_action_impl_with_outcome::<StellarSteadyHand>(settings, condition, succeeded),
+            Action::RapidSynthesis => {
+                self.use_action_impl_with_outcome::<RapidSynthesis>(settings, condition, succeeded)
+            }
+            Action::HastyTouch => {
+                self.use_action_impl_with_outcome::<HastyTouch>(settings, condition, succeeded)
+            }
+            Action::DaringTouch => {
+                self.use_action_impl_with_outcome::<DaringTouch>(settings, condition, succeeded)
+            }
+            Action::FinalAppraisal => {
+                self.use_action_impl_with_outcome::<FinalAppraisal>(settings, condition, succeeded)
+            }
+            Action::CarefulObservation => self
+                .use_action_impl_with_outcome::<CarefulObservation>(settings, condition, succeeded),
         }
     }
 }
@@ -395,5 +471,43 @@ mod tests {
 
         assert_eq!(normal_tool.quality, 15);
         assert_eq!(cosmic_tool.quality, 17);
+    }
+
+    #[test]
+    fn unreliable_failure_consumes_the_action_without_granting_success_effects() {
+        let settings = Settings {
+            max_cp: 500,
+            max_durability: 40,
+            max_progress: 100,
+            max_quality: 1000,
+            base_progress: 10,
+            base_quality: 10,
+            job_level: 100,
+            allowed_actions: ActionMask::all(),
+            adversarial: false,
+            backload_progress: false,
+            stellar_steady_hand_charges: 0,
+        };
+        let state = SimulationState::new(&settings);
+
+        assert_eq!(
+            state.use_action(Action::HastyTouch, Condition::Normal, &settings),
+            Err(ActionError::UnreliableAction)
+        );
+        let failed = state
+            .use_action_with_outcome(Action::HastyTouch, Condition::Normal, &settings, false)
+            .unwrap();
+        assert_eq!(failed.cp, state.cp);
+        assert_eq!(failed.durability, state.durability - 10);
+        assert_eq!(failed.quality, 0);
+        assert_eq!(failed.effects.inner_quiet(), 0);
+        assert!(!failed.effects.expedience());
+
+        let succeeded = state
+            .use_action_with_outcome(Action::HastyTouch, Condition::Normal, &settings, true)
+            .unwrap();
+        assert!(succeeded.quality > 0);
+        assert_eq!(succeeded.effects.inner_quiet(), 1);
+        assert!(succeeded.effects.expedience());
     }
 }

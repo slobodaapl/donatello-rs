@@ -263,6 +263,9 @@ impl QualityUbSolver {
                             })
                             .copied()
                             .collect();
+                        if templates.is_empty() {
+                            continue;
+                        }
                         // 2 * durability_cost is the minimum CP a state must have to not be considered "final".
                         // See `ReducedState::is_final` for details.
                         for cp in (min_solved_cp..=self.context.settings.max_cp()).step_by(2) {

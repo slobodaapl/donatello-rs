@@ -1097,6 +1097,7 @@ dependencies = [
 name = "donatello-ffi"
 version = "0.1.0"
 dependencies = [
+ "gabriel-solver",
  "gathering-solvers",
  "raphael-sim",
  "raphael-solver",
@@ -1697,9 +1698,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "gabriel-solver"
+version = "0.1.0"
+dependencies = [
+ "raphael-sim",
+ "rayon",
+ "wide",
+]
+
+[[package]]
 name = "gathering-solvers"
 version = "0.1.0"
 dependencies = [
+ "rustc-hash 2.1.1",
  "serde",
 ]
 

@@ -99,6 +99,9 @@ pub struct SearchQueue {
     batch_ordering: BTreeSet<SearchScore>,
     batches: FxHashMap<SearchScore, Vec<SearchNode>>,
     visited_nodes: Vec<SearchNode>,
+    /// Cached reconstructed states aligned with `visited_nodes`. Survivors store
+    /// the live `(state, condition)`; prefix-only nodes are `None`.
+    visited_states: Vec<Option<(SimulationState, Condition)>>,
     num_inserted_nodes: usize,
     initial_state: SimulationState,
     initial_condition: Condition,
@@ -137,6 +140,7 @@ impl SearchQueue {
                     .with_parent_idx(0)
                     .with_action(ActionCombo::None),
             ],
+            visited_states: vec![Some((initial_state, initial_condition))],
             num_inserted_nodes: 0,
             initial_state,
             initial_condition,
@@ -159,7 +163,7 @@ impl SearchQueue {
                 .with_parent_idx_checked(parent_idx)
                 .map_err(|_| SolverException::SearchQueueCapacityExceeded)?
                 .with_action(ActionCombo::Single(action));
-            self.visited_nodes.push(node);
+            self.push_visited(node, None);
             parent_idx = self.visited_nodes.len() - 1;
         }
         self.push(score, ActionCombo::None, parent_idx)
@@ -236,7 +240,7 @@ impl SearchQueue {
                 .with_parent_idx_checked(parent_idx)
                 .map_err(|_| SolverException::SearchQueueCapacityExceeded)?
                 .with_action(action);
-            self.visited_nodes.push(node);
+            self.push_visited(node, None);
             parent_idx = self.visited_nodes.len() - 1;
         }
         SearchNode::new()
@@ -262,24 +266,12 @@ impl SearchQueue {
         if let Some(score) = self.batch_ordering.pop_last()
             && let Some(batch) = self.batches.remove(&score)
         {
-            // Because each node only stores the previous action and idx of the parent, we first need
-            // to backtrack and replay all actions from the initial state to get the current state.
+            // Replay only from the nearest cached ancestor. Survivors store their
+            // reconstructed state, so typical pops apply a single action.
             let batch: Vec<(SearchNode, SimulationState, Condition)> = batch
                 .into_par_iter()
                 .map(|search_node| {
-                    let mut state = self.initial_state;
-                    let mut condition = self.initial_condition;
-                    let actions = self.get_actions_from_node_idx(search_node.parent_idx());
-                    for action in actions {
-                        (state, condition) =
-                            execute_search_action(&self.settings, state, condition, action);
-                    }
-                    (state, condition) = execute_search_action(
-                        &self.settings,
-                        state,
-                        condition,
-                        search_node.action(),
-                    );
+                    let (state, condition) = self.reconstruct_node(search_node);
                     (search_node, state, condition)
                 })
                 .collect();
@@ -315,14 +307,56 @@ impl SearchQueue {
                     })
                     .collect(),
             };
-            self.visited_nodes.extend(
-                non_dominated_nodes
-                    .into_iter()
-                    .map(|expanded_node| expanded_node.0),
-            );
+            for expanded_node in non_dominated_nodes {
+                self.push_visited(
+                    expanded_node.0,
+                    Some((expanded_node.1, expanded_node.2)),
+                );
+            }
             Some(batch)
         } else {
             None
+        }
+    }
+
+    fn push_visited(
+        &mut self,
+        node: SearchNode,
+        state: Option<(SimulationState, Condition)>,
+    ) {
+        self.visited_nodes.push(node);
+        self.visited_states.push(state);
+        debug_assert_eq!(self.visited_nodes.len(), self.visited_states.len());
+    }
+
+    fn reconstruct_node(&self, node: SearchNode) -> (SimulationState, Condition) {
+        let (state, condition) = self.state_at(node.parent_idx());
+        execute_search_action(&self.settings, state, condition, node.action())
+    }
+
+    fn state_at(&self, mut idx: usize) -> (SimulationState, Condition) {
+        let mut suffix = SmallVec::<[ActionCombo; 8]>::new();
+        loop {
+            if let Some(cached) = self.visited_states.get(idx).and_then(|state| *state) {
+                let mut state = cached.0;
+                let mut condition = cached.1;
+                for action in suffix.into_iter().rev() {
+                    (state, condition) =
+                        execute_search_action(&self.settings, state, condition, action);
+                }
+                return (state, condition);
+            }
+            if idx == 0 {
+                let mut state = self.initial_state;
+                let mut condition = self.initial_condition;
+                for action in suffix.into_iter().rev() {
+                    (state, condition) =
+                        execute_search_action(&self.settings, state, condition, action);
+                }
+                return (state, condition);
+            }
+            suffix.push(self.visited_nodes[idx].action());
+            idx = self.visited_nodes[idx].parent_idx();
         }
     }
 

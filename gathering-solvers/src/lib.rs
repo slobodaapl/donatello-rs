@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -365,16 +365,16 @@ fn legacy_result(
 
 struct ExpectedSolver<'a> {
     request: &'a SolveRequest,
-    memo: HashMap<State, Value>,
-    visiting: HashSet<State>,
+    memo: FxHashMap<State, Value>,
+    visiting: FxHashSet<State>,
 }
 
 impl<'a> ExpectedSolver<'a> {
     fn new(request: &'a SolveRequest) -> Self {
         Self {
             request,
-            memo: HashMap::new(),
-            visiting: HashSet::new(),
+            memo: FxHashMap::default(),
+            visiting: FxHashSet::default(),
         }
     }
 
@@ -509,7 +509,8 @@ impl<'a> ExpectedSolver<'a> {
             GatheringAction::Scrutiny
                 if self.request.actions.scrutiny
                     && !state.scrutiny
-                    && state.gp >= self.request.actions.scrutiny_cost =>
+                    && state.gp >= self.request.actions.scrutiny_cost
+                    && self.appraisal_useful(state) =>
             {
                 let mut next = state;
                 next.gp -= self.request.actions.scrutiny_cost;
@@ -519,7 +520,8 @@ impl<'a> ExpectedSolver<'a> {
             GatheringAction::CollectorsFocus
                 if self.request.actions.collectors_focus
                     && !state.collectors_focus
-                    && state.gp >= self.request.actions.focus_cost =>
+                    && state.gp >= self.request.actions.focus_cost
+                    && self.appraisal_useful(state) =>
             {
                 let mut next = state;
                 next.gp -= self.request.actions.focus_cost;
@@ -529,7 +531,8 @@ impl<'a> ExpectedSolver<'a> {
             GatheringAction::PrimingTouch
                 if self.request.actions.priming_touch
                     && !state.priming_touch
-                    && state.gp >= self.request.actions.priming_cost =>
+                    && state.gp >= self.request.actions.priming_cost
+                    && self.appraisal_useful(state) =>
             {
                 let mut next = state;
                 next.gp -= self.request.actions.priming_cost;
@@ -812,7 +815,23 @@ fn binary_outcomes(bp: u16, success: State, failure: State) -> Vec<(f64, State, 
 }
 
 fn merge_outcomes(outcomes: Vec<(f64, State, f64, f64)>) -> Vec<(f64, State, f64, f64)> {
-    let mut merged: HashMap<(State, u64, u64), f64> = HashMap::new();
+    if outcomes.len() <= 88 {
+        let mut merged: Vec<(f64, State, f64, f64)> = Vec::with_capacity(outcomes.len());
+        for (probability, state, reward, perfect_collects) in outcomes {
+            if let Some(existing) = merged.iter_mut().find(|candidate| {
+                candidate.1 == state
+                    && candidate.2.to_bits() == reward.to_bits()
+                    && candidate.3.to_bits() == perfect_collects.to_bits()
+            }) {
+                existing.0 += probability;
+            } else {
+                merged.push((probability, state, reward, perfect_collects));
+            }
+        }
+        return merged;
+    }
+
+    let mut merged = FxHashMap::<(State, u64, u64), f64>::default();
     for (probability, state, reward, perfect_collects) in outcomes {
         *merged
             .entry((state, reward.to_bits(), perfect_collects.to_bits()))

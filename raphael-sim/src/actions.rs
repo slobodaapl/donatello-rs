@@ -1159,18 +1159,6 @@ impl ActionImpl for RapidSynthesis {
         .with_trained_perfection_active(false);
     const EFFECT_SET_MASK: Effects = Effects::new();
 
-    fn precondition(
-        state: &SimulationState,
-        _settings: &Settings,
-        condition: Condition,
-    ) -> Result<(), ActionError> {
-        // Only actions with 100% success rate are supported.
-        if Action::RapidSynthesis.success_rate(state, condition) < 100 {
-            return Err(ActionError::UnreliableAction);
-        }
-        Ok(())
-    }
-
     fn progress_modifier(_state: &SimulationState, settings: &Settings) -> u32 {
         match settings.job_level {
             0..63 => 250,
@@ -1196,12 +1184,8 @@ impl ActionImpl for HastyTouch {
     fn precondition(
         state: &SimulationState,
         _settings: &Settings,
-        condition: Condition,
+        _condition: Condition,
     ) -> Result<(), ActionError> {
-        // Only actions with 100% success rate are supported.
-        if Action::HastyTouch.success_rate(state, condition) < 100 {
-            return Err(ActionError::UnreliableAction);
-        }
         if state.effects.expedience() {
             // Hasty Touch gets upgraded to Daring Touch when expedience is active.
             return Err(ActionError::SpecialConditionNotMet);
@@ -1237,12 +1221,8 @@ impl ActionImpl for DaringTouch {
     fn precondition(
         state: &SimulationState,
         _settings: &Settings,
-        condition: Condition,
+        _condition: Condition,
     ) -> Result<(), ActionError> {
-        // Only actions with 100% success rate are supported.
-        if Action::DaringTouch.success_rate(state, condition) < 100 {
-            return Err(ActionError::UnreliableAction);
-        }
         if !state.effects.expedience() {
             return Err(ActionError::SpecialConditionNotMet);
         }

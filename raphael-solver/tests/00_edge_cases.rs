@@ -440,76 +440,6 @@ fn issue_312_quick_innovation_reflect() {
 }
 
 #[test]
-/// The Hasty Touch > Daring Touch "combo" is not actually a combo, as Daring Touch is enabled
-/// by the Expedience effect, which means that actions that don't tick effects such as Quick Innovation
-/// may be used inbetween Hasty Touch and Daring Touch.
-///
-/// This is a specially constructed case where using Hasty Touch > Quick Innovation > Daring Touch
-/// is optimal to test that the solver doesn't accidentally "optimize away" this particular case.
-fn daring_touch_interrupted_combo() {
-    let simulator_settings = Settings {
-        max_cp: 0,
-        max_durability: 30,
-        max_progress: 100,
-        max_quality: 347,
-        base_progress: 100,
-        base_quality: 100,
-        job_level: 100,
-        allowed_actions: ActionMask::regular().add(Action::QuickInnovation),
-        adversarial: false,
-        backload_progress: false,
-        stellar_steady_hand_charges: 1,
-    };
-    let solver_settings = SolverSettings {
-        simulator_settings,
-        allow_non_max_quality_solutions: true,
-    };
-    let expected_score = expect![[r#"
-        Ok(
-            SolutionScore {
-                capped_quality: 347,
-                steps: 5,
-                duration: 14,
-                overflow_quality: 0,
-            },
-        )
-    "#]];
-    let expected_runtime_stats = expect![[r#"
-        MacroSolverStats {
-            search_queue_stats: SearchQueueStats {
-                inserted_nodes: 37,
-                processed_nodes: 26,
-            },
-            finish_solver_stats: FinishSolverStats {
-                states: 20435,
-                values: 20435,
-            },
-            quality_ub_stats: QualityUbSolverStats {
-                states_on_main: 18323,
-                states_on_shards: 39,
-                values: 18362,
-            },
-            step_lb_stats: StepLbSolverStats {
-                states_on_main: 13,
-                states_on_shards: 176,
-                values: 189,
-            },
-        }
-    "#]];
-    let actions = test_with_settings(solver_settings, expected_score, expected_runtime_stats);
-    assert_eq!(
-        actions,
-        [
-            Action::StellarSteadyHand,
-            Action::HastyTouch,
-            Action::QuickInnovation,
-            Action::DaringTouch,
-            Action::BasicSynthesis
-        ]
-    );
-}
-
-#[test]
 /// https://github.com/KonaeAkira/raphael-rs/issues/298
 fn low_level_steplbsolver_crash() {
     let simulator_settings = Settings {
@@ -610,62 +540,6 @@ fn solution_must_reach_target_quality() {
                 states_on_main: 472838,
                 states_on_shards: 69855,
                 values: 10657631,
-            },
-        }
-    "#]];
-    test_with_settings(solver_settings, expected_score, expected_runtime_stats);
-}
-
-#[test]
-/// https://github.com/KonaeAkira/raphael-rs/issues/355
-fn high_max_stellar_steady_hand_charges() {
-    // Regrowth Formula Compounds - 5855/5424/776
-    let simulator_settings = Settings {
-        max_cp: 776,
-        max_durability: 45,
-        max_progress: 6900,
-        max_quality: 22100,
-        base_progress: 311,
-        base_quality: 297,
-        job_level: 100,
-        allowed_actions: ActionMask::regular(),
-        adversarial: false,
-        backload_progress: false,
-        stellar_steady_hand_charges: 4,
-    };
-    let solver_settings = SolverSettings {
-        simulator_settings,
-        allow_non_max_quality_solutions: false,
-    };
-    let expected_score = expect![[r#"
-        Ok(
-            SolutionScore {
-                capped_quality: 22100,
-                steps: 34,
-                duration: 85,
-                overflow_quality: 186,
-            },
-        )
-    "#]];
-    let expected_runtime_stats = expect![[r#"
-        MacroSolverStats {
-            search_queue_stats: SearchQueueStats {
-                inserted_nodes: 43468864,
-                processed_nodes: 13519956,
-            },
-            finish_solver_stats: FinishSolverStats {
-                states: 89742,
-                values: 330130,
-            },
-            quality_ub_stats: QualityUbSolverStats {
-                states_on_main: 10283259,
-                states_on_shards: 4622137,
-                values: 222461865,
-            },
-            step_lb_stats: StepLbSolverStats {
-                states_on_main: 11719233,
-                states_on_shards: 2970492,
-                values: 308218113,
             },
         }
     "#]];

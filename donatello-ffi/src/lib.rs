@@ -15,8 +15,9 @@ use raphael_solver::{
 };
 use serde::{Deserialize, Serialize};
 
-const ABI_VERSION: u32 = 10;
+const ABI_VERSION: u32 = 12;
 const DEFAULT_CACHE_BUDGET: usize = 512 * 1024 * 1024;
+const DEFAULT_GABRIEL_WORKER_THREADS: usize = 4;
 
 type CachedSolver = Arc<Mutex<MacroSolver<'static>>>;
 static SOLVER_CACHE: OnceLock<Mutex<SolverCache>> = OnceLock::new();
@@ -67,6 +68,8 @@ struct CraftSolveRequest {
     #[serde(default)]
     hard_deadline_millis: u64,
     #[serde(default)]
+    reset_soft_deadline_on_improvement: bool,
+    #[serde(default)]
     bypass_solution_cache: bool,
     root: RootState,
 }
@@ -102,6 +105,71 @@ struct RootState {
     expedience: bool,
     condition: u8,
     crafter_delineations: u8,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GabrielSolveRequest {
+    abi_version: u32,
+    operation: u8,
+    policy_profile: u8,
+    max_cp: u16,
+    max_durability: u16,
+    max_progress: u16,
+    max_quality: u16,
+    required_quality: u16,
+    base_progress: u16,
+    base_quality: u16,
+    job_level: u8,
+    manipulation: bool,
+    specialist: bool,
+    condition_probabilities_bps: [u16; gabriel_solver::CONDITION_COUNT],
+    #[serde(default = "default_gabriel_worker_threads")]
+    worker_threads: usize,
+    max_steps: u8,
+    max_decisions: u8,
+    #[serde(default)]
+    samples: usize,
+    seed: u64,
+    root: GabrielRootState,
+}
+
+const fn default_gabriel_worker_threads() -> usize {
+    DEFAULT_GABRIEL_WORKER_THREADS
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GabrielRootState {
+    #[serde(flatten)]
+    state: RootState,
+    step: u8,
+    decisions: u8,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GabrielSolveResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    planned: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_closure: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidate_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rollout_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    successes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    samples: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probability: Option<f64>,
+    elapsed_millis: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -173,7 +241,10 @@ fn condition(value: u8) -> Result<Condition, String> {
     }
 }
 
-fn build_state(root: &RootState, allow_careful_observation: bool) -> Result<SimulationState, String> {
+fn build_state(
+    root: &RootState,
+    allow_careful_observation: bool,
+) -> Result<SimulationState, String> {
     let combo = match root.combo {
         0 => Combo::None,
         1 => Combo::BasicTouch,
@@ -217,6 +288,167 @@ fn build_state(root: &RootState, allow_careful_observation: bool) -> Result<Simu
         unreliable_quality: 0,
         effects,
     })
+}
+
+fn build_gabriel_model(
+    request: &GabrielSolveRequest,
+) -> Result<(gabriel_solver::RecipeModel, gabriel_solver::State), String> {
+    if request.abi_version != ABI_VERSION {
+        return Err(format!("unsupported ABI version {}", request.abi_version));
+    }
+    if request.policy_profile != 1 {
+        return Err(format!(
+            "unsupported Gabriel policy profile {}",
+            request.policy_profile
+        ));
+    }
+    if !(1..=gabriel_solver::MAX_WORKER_THREADS).contains(&request.worker_threads) {
+        return Err(format!(
+            "Gabriel worker threads must be within 1..={}",
+            gabriel_solver::MAX_WORKER_THREADS
+        ));
+    }
+    let mut allowed_actions = ActionMask::all()
+        .remove(Action::TrainedEye)
+        .remove(Action::StellarSteadyHand)
+        .remove(Action::CarefulObservation)
+        .remove(Action::QuickInnovation);
+    if !request.manipulation {
+        allowed_actions = allowed_actions.remove(Action::Manipulation);
+    }
+    if !request.specialist {
+        allowed_actions = allowed_actions.remove(Action::HeartAndSoul);
+    }
+    let settings = Settings {
+        max_cp: request.max_cp,
+        max_durability: request.max_durability,
+        max_progress: request.max_progress,
+        max_quality: request.max_quality,
+        base_progress: request.base_progress,
+        base_quality: request.base_quality,
+        job_level: request.job_level,
+        allowed_actions,
+        adversarial: false,
+        backload_progress: false,
+        stellar_steady_hand_charges: 0,
+    };
+    let model = gabriel_solver::RecipeModel {
+        settings,
+        required_quality: request.required_quality,
+        condition_probabilities_bps: request.condition_probabilities_bps,
+        max_steps: request.max_steps,
+        max_decisions: request.max_decisions,
+    };
+    model.validate()?;
+    let mut simulation = build_state(&request.root.state, true)?;
+    simulation.effects = simulation
+        .effects
+        .with_careful_observation_charges(request.root.state.careful_observation_charges.min(3))
+        .with_crafter_delineations(request.root.state.crafter_delineations.min(5))
+        .with_heart_and_soul_available(request.root.state.heart_and_soul_available)
+        .with_quick_innovation_available(request.root.state.quick_innovation_available);
+    let state = gabriel_solver::State {
+        simulation,
+        condition: condition(request.root.state.condition)?,
+        step: request.root.step,
+        decisions: request.root.decisions,
+    };
+    Ok((model, state))
+}
+
+fn solve_gabriel(request: GabrielSolveRequest) -> GabrielSolveResponse {
+    let started = std::time::Instant::now();
+    let result = (|| {
+        let (model, state) = build_gabriel_model(&request)?;
+        match request.operation {
+            0 => {
+                let recommendation = gabriel_solver::recommend_with_worker_threads(
+                    &model,
+                    state,
+                    request.seed,
+                    request.worker_threads,
+                )?;
+                Ok(GabrielSolveResponse {
+                    ok: true,
+                    action_id: Some(recommendation.action.action_id()),
+                    planned: Some(recommendation.planned),
+                    failure_closure: Some(recommendation.failure_closure),
+                    candidate_count: Some(recommendation.candidate_count),
+                    rollout_count: Some(recommendation.rollout_count),
+                    successes: None,
+                    samples: None,
+                    probability: None,
+                    elapsed_millis: started.elapsed().as_millis(),
+                    error: None,
+                })
+            }
+            1 => {
+                if !(1..=100_000).contains(&request.samples) {
+                    return Err(String::from(
+                        "Gabriel probability samples must be within 1..=100000",
+                    ));
+                }
+                let estimate =
+                    gabriel_solver::estimate_full_quality_probability_with_worker_threads(
+                        &model,
+                        state,
+                        request.samples,
+                        request.seed,
+                        request.worker_threads,
+                    )?;
+                Ok(GabrielSolveResponse {
+                    ok: true,
+                    action_id: None,
+                    planned: None,
+                    failure_closure: None,
+                    candidate_count: None,
+                    rollout_count: None,
+                    successes: Some(estimate.successes),
+                    samples: Some(estimate.samples),
+                    probability: Some(estimate.probability()),
+                    elapsed_millis: started.elapsed().as_millis(),
+                    error: None,
+                })
+            }
+            operation => Err(format!("unsupported Gabriel operation {operation}")),
+        }
+    })();
+    result.unwrap_or_else(|error| GabrielSolveResponse {
+        ok: false,
+        action_id: None,
+        planned: None,
+        failure_closure: None,
+        candidate_count: None,
+        rollout_count: None,
+        successes: None,
+        samples: None,
+        probability: None,
+        elapsed_millis: started.elapsed().as_millis(),
+        error: Some(error),
+    })
+}
+
+fn gabriel_json(data: &[u8]) -> String {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let request: GabrielSolveRequest =
+            serde_json::from_slice(data).map_err(|error| error.to_string())?;
+        Ok::<_, String>(solve_gabriel(request))
+    }))
+    .unwrap_or_else(|_| Err(String::from("Gabriel native solver panic")));
+    let response = result.unwrap_or_else(|error| GabrielSolveResponse {
+        ok: false,
+        action_id: None,
+        planned: None,
+        failure_closure: None,
+        candidate_count: None,
+        rollout_count: None,
+        successes: None,
+        samples: None,
+        probability: None,
+        elapsed_millis: 0,
+        error: Some(error),
+    });
+    serde_json::to_string(&response).unwrap()
 }
 
 fn solve(request: CraftSolveRequest, interrupt: AtomicFlag) -> Result<SolveResult, String> {
@@ -349,14 +581,19 @@ fn solve(request: CraftSolveRequest, interrupt: AtomicFlag) -> Result<SolveResul
         });
     }
     solver.set_interrupt_signal(interrupt.clone());
+    let improved_solution = solver.improved_solution_signal();
     let complete_solution = solver.complete_solution_signal();
+    improved_solution.store(false, Ordering::Release);
+    complete_solution.store(false, Ordering::Release);
     let deadline_reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (deadline_done, deadline_worker) = start_deadline_worker(
         interrupt.clone(),
+        improved_solution,
         complete_solution,
         Arc::clone(&deadline_reached),
         request.soft_deadline_millis,
         request.hard_deadline_millis,
+        request.reset_soft_deadline_on_improvement,
     );
     let result = match request.solve_mode {
         1 => solve_completion(solver_settings, state, current_condition, interrupt.clone()),
@@ -696,12 +933,46 @@ fn plan_score(
     )
 }
 
+#[derive(Default)]
+struct DeadlineTracker {
+    quiet_started_millis: u64,
+    complete_solution_seen: bool,
+}
+
+impl DeadlineTracker {
+    fn should_interrupt(
+        &mut self,
+        elapsed_millis: u64,
+        improved_solution: bool,
+        complete_solution: bool,
+        soft_millis: u64,
+        hard_millis: u64,
+        reset_soft_deadline_on_improvement: bool,
+    ) -> bool {
+        let first_completion = complete_solution && !self.complete_solution_seen;
+        self.complete_solution_seen = complete_solution;
+        if reset_soft_deadline_on_improvement && (improved_solution || first_completion) {
+            self.quiet_started_millis = elapsed_millis;
+        }
+        let soft_elapsed = if reset_soft_deadline_on_improvement {
+            elapsed_millis.saturating_sub(self.quiet_started_millis)
+        } else {
+            elapsed_millis
+        };
+        let soft_expired = soft_millis != 0 && soft_elapsed >= soft_millis;
+        let hard_expired = hard_millis != 0 && elapsed_millis >= hard_millis;
+        hard_expired || (soft_expired && complete_solution)
+    }
+}
+
 fn start_deadline_worker(
     interrupt: AtomicFlag,
+    improved_solution: Arc<std::sync::atomic::AtomicBool>,
     complete_solution: Arc<std::sync::atomic::AtomicBool>,
     deadline_reached: Arc<std::sync::atomic::AtomicBool>,
     soft_millis: u64,
     hard_millis: u64,
+    reset_soft_deadline_on_improvement: bool,
 ) -> (
     std::sync::mpsc::Sender<()>,
     Option<std::thread::JoinHandle<()>>,
@@ -712,17 +983,21 @@ fn start_deadline_worker(
     }
     let worker = std::thread::spawn(move || {
         let started = std::time::Instant::now();
+        let mut tracker = DeadlineTracker::default();
         loop {
             match done_rx.recv_timeout(std::time::Duration::from_millis(5)) {
                 Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
             let elapsed = started.elapsed().as_millis() as u64;
-            let soft_expired = soft_millis != 0 && elapsed >= soft_millis;
-            let hard_expired = hard_millis != 0 && elapsed >= hard_millis;
-            if hard_expired
-                || (soft_expired && complete_solution.load(std::sync::atomic::Ordering::Acquire))
-            {
+            if tracker.should_interrupt(
+                elapsed,
+                improved_solution.swap(false, std::sync::atomic::Ordering::AcqRel),
+                complete_solution.load(std::sync::atomic::Ordering::Acquire),
+                soft_millis,
+                hard_millis,
+                reset_soft_deadline_on_improvement,
+            ) {
                 deadline_reached.store(true, std::sync::atomic::Ordering::Release);
                 interrupt.set();
                 return;
@@ -1021,6 +1296,19 @@ pub unsafe extern "C" fn donatello_gathering_solve_json(
 #[unsafe(no_mangle)]
 /// # Safety
 /// `data` must be null or point to `len` readable bytes for the duration of the call.
+pub unsafe extern "C" fn gabriel_solve_json(data: *const u8, len: usize) -> *mut c_char {
+    if data.is_null() {
+        return CString::new(r#"{"ok":false,"elapsedMillis":0,"error":"null request pointer"}"#)
+            .unwrap()
+            .into_raw();
+    }
+    let bytes = unsafe { slice::from_raw_parts(data, len) };
+    CString::new(gabriel_json(bytes)).unwrap().into_raw()
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `data` must be null or point to `len` readable bytes for the duration of the call.
 pub unsafe extern "C" fn donatello_solve_json(data: *const u8, len: usize) -> *mut c_char {
     if data.is_null() {
         return response_json(Err(String::from("null request pointer"))).into_raw();
@@ -1149,9 +1437,136 @@ mod tests {
 
     fn request(condition: u8) -> Vec<u8> {
         format!(
-            r#"{{"abiVersion":10,"maxCp":500,"maxDurability":40,"maxProgress":500,"maxQuality":500,"baseProgress":100,"baseQuality":100,"jobLevel":100,"manipulation":true,"specialist":false,"solveMode":0,"progressFirst":false,"minimizeSteps":false,"stellarSteadyHandCharges":0,"root":{{"cp":500,"durability":40,"progress":0,"quality":0,"innerQuiet":0,"wasteNot":0,"manipulation":0,"innovation":0,"veneration":0,"greatStrides":0,"muscleMemory":0,"finalAppraisal":0,"carefulObservationCharges":0,"combo":3,"heartAndSoulActive":false,"heartAndSoulAvailable":false,"quickInnovationAvailable":false,"trainedPerfectionActive":false,"trainedPerfectionAvailable":true,"stellarSteadyHandCharges":0,"stellarSteadyHand":0,"expedience":false,"condition":{condition},"crafterDelineations":0}}}}"#
+            r#"{{"abiVersion":{ABI_VERSION},"maxCp":500,"maxDurability":40,"maxProgress":500,"maxQuality":500,"baseProgress":100,"baseQuality":100,"jobLevel":100,"manipulation":true,"specialist":false,"solveMode":0,"progressFirst":false,"minimizeSteps":false,"stellarSteadyHandCharges":0,"root":{{"cp":500,"durability":40,"progress":0,"quality":0,"innerQuiet":0,"wasteNot":0,"manipulation":0,"innovation":0,"veneration":0,"greatStrides":0,"muscleMemory":0,"finalAppraisal":0,"carefulObservationCharges":0,"combo":3,"heartAndSoulActive":false,"heartAndSoulAvailable":false,"quickInnovationAvailable":false,"trainedPerfectionActive":false,"trainedPerfectionAvailable":true,"stellarSteadyHandCharges":0,"stellarSteadyHand":0,"expedience":false,"condition":{condition},"crafterDelineations":0}}}}"#
         )
         .into_bytes()
+    }
+
+    fn gabriel_request() -> Vec<u8> {
+        let root = serde_json::json!({
+            "cp": 700,
+            "durability": 60,
+            "progress": 0,
+            "quality": 0,
+            "innerQuiet": 0,
+            "wasteNot": 0,
+            "manipulation": 0,
+            "innovation": 0,
+            "veneration": 0,
+            "greatStrides": 0,
+            "muscleMemory": 0,
+            "finalAppraisal": 0,
+            "carefulObservationCharges": 3,
+            "combo": 3,
+            "heartAndSoulActive": false,
+            "heartAndSoulAvailable": true,
+            "quickInnovationAvailable": true,
+            "trainedPerfectionActive": false,
+            "trainedPerfectionAvailable": true,
+            "stellarSteadyHandCharges": 0,
+            "stellarSteadyHand": 0,
+            "splendorCosmic": true,
+            "expedience": false,
+            "condition": 0,
+            "crafterDelineations": 2,
+            "step": 0,
+            "decisions": 0
+        });
+        serde_json::to_vec(&serde_json::json!({
+            "abiVersion": ABI_VERSION,
+            "operation": 0,
+            "recipeLevelTableId": 776,
+            "policyProfile": 1,
+            "maxCp": 700,
+            "maxDurability": 60,
+            "maxProgress": 11_250,
+            "maxQuality": 31_520,
+            "requiredQuality": 31_520,
+            "baseProgress": 323,
+            "baseQuality": 322,
+            "jobLevel": 100,
+            "manipulation": true,
+            "specialist": true,
+            "conditionProbabilitiesBps": [2_000, 1_000, 0, 0, 1_500, 1_000, 1_500, 1_000, 1_000, 0, 1_000],
+            "workerThreads": 1,
+            "maxSteps": 55,
+            "maxDecisions": 64,
+            "samples": 0,
+            "seed": 1,
+            "root": root
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn gabriel_ffi_accepts_dynamic_recipe_stats_and_action_resources() {
+        let response: serde_json::Value =
+            serde_json::from_str(&gabriel_json(&gabriel_request())).unwrap();
+        assert_eq!(response["ok"], true);
+        assert!(response["actionId"].as_u64().is_some());
+
+        let mut invalid_vector: serde_json::Value =
+            serde_json::from_slice(&gabriel_request()).unwrap();
+        invalid_vector["conditionProbabilitiesBps"][0] = serde_json::json!(2_001);
+        let response = gabriel_json(&serde_json::to_vec(&invalid_vector).unwrap());
+        assert!(response.contains(r#""ok":false"#));
+        assert!(response.contains("expected 10000"));
+
+        let mut invalid_workers: serde_json::Value =
+            serde_json::from_slice(&gabriel_request()).unwrap();
+        invalid_workers["workerThreads"] = serde_json::json!(0);
+        let response = gabriel_json(&serde_json::to_vec(&invalid_workers).unwrap());
+        assert!(response.contains(r#""ok":false"#));
+        assert!(response.contains("worker threads must be within 1..=256"));
+
+        let mut arbitrary: serde_json::Value = serde_json::from_slice(&gabriel_request()).unwrap();
+        arbitrary["recipeLevelTableId"] = serde_json::json!(999);
+        arbitrary["maxCp"] = serde_json::json!(420);
+        arbitrary["maxDurability"] = serde_json::json!(35);
+        arbitrary["maxProgress"] = serde_json::json!(7_500);
+        arbitrary["maxQuality"] = serde_json::json!(21_000);
+        arbitrary["requiredQuality"] = serde_json::json!(21_000);
+        arbitrary["baseProgress"] = serde_json::json!(180);
+        arbitrary["baseQuality"] = serde_json::json!(170);
+        arbitrary["jobLevel"] = serde_json::json!(80);
+        arbitrary["manipulation"] = serde_json::json!(false);
+        arbitrary["specialist"] = serde_json::json!(false);
+        arbitrary["root"]["cp"] = serde_json::json!(420);
+        arbitrary["root"]["durability"] = serde_json::json!(35);
+        arbitrary["root"]["carefulObservationCharges"] = serde_json::json!(0);
+        arbitrary["root"]["heartAndSoulAvailable"] = serde_json::json!(false);
+        arbitrary["root"]["quickInnovationAvailable"] = serde_json::json!(false);
+        arbitrary["root"]["splendorCosmic"] = serde_json::json!(false);
+        arbitrary["root"]["crafterDelineations"] = serde_json::json!(0);
+        let response: serde_json::Value =
+            serde_json::from_str(&gabriel_json(&serde_json::to_vec(&arbitrary).unwrap())).unwrap();
+        assert_eq!(response["ok"], true);
+        assert!(response["actionId"].as_u64().is_some());
+    }
+
+    #[test]
+    fn gabriel_excludes_forbidden_specialist_actions_even_when_available() {
+        let request: GabrielSolveRequest = serde_json::from_slice(&gabriel_request()).unwrap();
+        let (model, state) = build_gabriel_model(&request).unwrap();
+
+        assert!(
+            !model
+                .settings
+                .allowed_actions
+                .has(Action::CarefulObservation)
+        );
+        assert!(!model.settings.allowed_actions.has(Action::QuickInnovation));
+        assert!(
+            !model
+                .settings
+                .allowed_actions
+                .has(Action::StellarSteadyHand)
+        );
+        assert!(model.settings.allowed_actions.has(Action::HeartAndSoul));
+        assert_eq!(state.simulation.effects.careful_observation_charges(), 3);
+        assert!(state.simulation.effects.quick_innovation_available());
+        assert_eq!(state.simulation.effects.crafter_delineations(), 2);
+        assert!(state.simulation.effects.heart_and_soul_available());
     }
 
     #[test]
@@ -1188,7 +1603,11 @@ mod tests {
         disabled.root.careful_observation_charges = 1;
         disabled.root.crafter_delineations = 1;
         let result = solve(disabled, AtomicFlag::new()).expect("disabled Poor solve must succeed");
-        assert!(!result.action_ids.contains(&Action::CarefulObservation.action_id()));
+        assert!(
+            !result
+                .action_ids
+                .contains(&Action::CarefulObservation.action_id())
+        );
     }
 
     #[test]
@@ -1325,10 +1744,18 @@ mod tests {
     #[test]
     fn soft_deadline_without_completion_waits_for_hard_timeout() {
         let interrupt = AtomicFlag::new();
+        let improved_solution = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (done, worker) =
-            start_deadline_worker(interrupt.clone(), completed, Arc::clone(&reached), 5, 30);
+        let (done, worker) = start_deadline_worker(
+            interrupt.clone(),
+            improved_solution,
+            completed,
+            Arc::clone(&reached),
+            5,
+            30,
+            false,
+        );
         std::thread::sleep(std::time::Duration::from_millis(15));
         assert!(!interrupt.is_set());
         std::thread::sleep(std::time::Duration::from_millis(25));
@@ -1501,6 +1928,7 @@ mod tests {
                 incumbent_action_ids: Vec::new(),
                 soft_deadline_millis: 0,
                 hard_deadline_millis: 0,
+                reset_soft_deadline_on_improvement: false,
                 bypass_solution_cache: true,
                 root: root_from_state(state, current_condition),
             };
@@ -1541,7 +1969,37 @@ mod tests {
 
     #[test]
     fn abi_version_is_stable() {
-        assert_eq!(donatello_abi_version(), 10);
+        assert_eq!(donatello_abi_version(), 12);
+    }
+
+    #[test]
+    fn improvement_quiescence_resets_only_for_new_best_plans() {
+        let mut tracker = DeadlineTracker::default();
+        assert!(!tracker.should_interrupt(0, false, true, 5_000, 0, true));
+        assert!(!tracker.should_interrupt(4_999, false, true, 5_000, 0, true));
+        assert!(tracker.should_interrupt(5_000, false, true, 5_000, 0, true));
+
+        assert!(!tracker.should_interrupt(5_000, true, true, 5_000, 0, true));
+        assert!(!tracker.should_interrupt(9_999, false, true, 5_000, 0, true));
+        assert!(tracker.should_interrupt(10_000, false, true, 5_000, 0, true));
+
+        assert!(!tracker.should_interrupt(10_000, true, true, 5_000, 0, true));
+        assert!(!tracker.should_interrupt(14_999, false, true, 5_000, 0, true));
+        assert!(tracker.should_interrupt(15_000, false, true, 5_000, 0, true));
+    }
+
+    #[test]
+    fn improvement_quiescence_waits_for_a_completion_but_preserves_hard_deadlines() {
+        let mut tracker = DeadlineTracker::default();
+        assert!(!tracker.should_interrupt(20_000, false, false, 5_000, 0, true));
+        assert!(!tracker.should_interrupt(20_000, false, true, 5_000, 0, true));
+        assert!(!tracker.should_interrupt(24_999, false, true, 5_000, 0, true));
+        assert!(tracker.should_interrupt(25_000, false, true, 5_000, 0, true));
+
+        let mut hard_limited = DeadlineTracker::default();
+        assert!(!hard_limited.should_interrupt(0, false, true, 5_000, 7_000, true));
+        assert!(!hard_limited.should_interrupt(6_999, true, true, 5_000, 7_000, true));
+        assert!(hard_limited.should_interrupt(7_000, true, true, 5_000, 7_000, true));
     }
 
     #[test]

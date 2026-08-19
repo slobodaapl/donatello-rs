@@ -8,6 +8,7 @@ members = [
     "raphael-translations",
     "donatello-ffi",
     "donatello-bench",
+    "gabriel-solver",
     "gathering-solvers",
 ]
 resolver = "2"

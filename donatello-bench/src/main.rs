@@ -908,6 +908,212 @@ fn run_case(
     })
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginPathBenchmarkPool {
+    version: u32,
+    brackets: Vec<PluginPathBenchmarkBracket>,
+    expert_brackets: Vec<PluginPathBenchmarkBracket>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginPathBenchmarkBracket {
+    job_level: u8,
+    level_low: u8,
+    craftsmanship_low: u16,
+    craftsmanship_high: u16,
+    control_low: u16,
+    control_high: u16,
+    cp_low: u16,
+    cp_high: u16,
+    recipes: Vec<PluginPathBenchmarkRecipe>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginPathBenchmarkRecipe {
+    recipe_id: u32,
+    item_id: u32,
+    req_craftsmanship: u16,
+    req_control: u16,
+    recipe_job_level: u8,
+    recipe_level_table_id: u16,
+    expert: bool,
+    progress_div: u32,
+    quality_div: u32,
+    progress_mod: u32,
+    quality_mod: u32,
+    max_durability: u16,
+    max_progress: u16,
+    max_quality: u16,
+}
+
+fn crafter_curve() -> [(u8, u16, u16, u16); 10] {
+    [
+        (10, 50, 45, 200),
+        (20, 110, 100, 230),
+        (30, 180, 165, 260),
+        (40, 250, 230, 295),
+        (50, 350, 325, 340),
+        (60, 950, 850, 400),
+        (70, 1550, 1450, 470),
+        (80, 2450, 2250, 515),
+        (90, 3350, 3150, 550),
+        (100, 5200, 4800, 630),
+    ]
+}
+
+fn plugin_path_benchmark_pool() -> PluginPathBenchmarkPool {
+    let curve = crafter_curve();
+    let mut brackets = Vec::with_capacity(curve.len());
+    for (index, (job_level, craftsmanship, control, cp)) in curve.into_iter().enumerate() {
+        let level_low = job_level.saturating_sub(9).max(1);
+        let (prev_cms, prev_ctl, prev_cp) = if index == 0 {
+            (
+                craftsmanship.saturating_mul(3) / 5,
+                control.saturating_mul(3) / 5,
+                cp.saturating_sub(20),
+            )
+        } else {
+            (curve[index - 1].1, curve[index - 1].2, curve[index - 1].3)
+        };
+        let craftsmanship_high = craftsmanship.saturating_add(craftsmanship / 10);
+        let control_high = control.saturating_add(control / 10);
+        let cp_high = cp.saturating_add(cp / 20);
+        let high_crafter = CrafterStats {
+            craftsmanship: craftsmanship_high,
+            control: control_high,
+            cp: cp_high,
+            level: job_level,
+            manipulation: job_level >= 65,
+            heart_and_soul: false,
+            quick_innovation: false,
+        };
+        let mut recipes = RECIPES
+            .entries()
+            .filter(|(_, recipe)| {
+                let recipe_job_level = RLVLS[recipe.recipe_level as usize].job_level;
+                recipe.max_level_scaling == 0
+                    && !recipe.is_expert
+                    && recipe_job_level >= level_low
+                    && recipe_job_level <= job_level
+                    && recipe.req_craftsmanship <= craftsmanship_high
+                    && recipe.req_control <= control_high
+            })
+            .map(|(recipe_id, recipe)| {
+                let settings = get_game_settings(*recipe, None, high_crafter, None, None);
+                let recipe_level = RLVLS[recipe.recipe_level as usize];
+                PluginPathBenchmarkRecipe {
+                    recipe_id,
+                    item_id: recipe.item_id,
+                    req_craftsmanship: recipe.req_craftsmanship,
+                    req_control: recipe.req_control,
+                    recipe_job_level: recipe_level.job_level,
+                    recipe_level_table_id: recipe.recipe_level,
+                    expert: false,
+                    progress_div: recipe_level.progress_div,
+                    quality_div: recipe_level.quality_div,
+                    progress_mod: recipe_level.progress_mod,
+                    quality_mod: recipe_level.quality_mod,
+                    max_durability: settings.max_durability,
+                    max_progress: settings.max_progress,
+                    max_quality: settings.max_quality,
+                }
+            })
+            .collect::<Vec<_>>();
+        recipes.sort_by_key(|recipe| (recipe.recipe_id, recipe.item_id));
+        assert!(
+            !recipes.is_empty(),
+            "level bracket {level_low}-{job_level} has no eligible regular recipes"
+        );
+        brackets.push(PluginPathBenchmarkBracket {
+            job_level,
+            level_low,
+            craftsmanship_low: prev_cms.min(craftsmanship),
+            craftsmanship_high,
+            control_low: prev_ctl.min(control),
+            control_high,
+            cp_low: prev_cp.min(cp),
+            cp_high,
+            recipes,
+        });
+    }
+
+    // Expert recipes sit on expansion job levels (80 / 90 / 100), not 91-99.
+    let expert_bands = [(80u8, 80u8, 89u8), (90, 90, 99), (100, 100, 100)];
+    let mut expert_brackets = Vec::with_capacity(expert_bands.len());
+    for (plot_level, recipe_low, recipe_high) in expert_bands {
+        let Some(stats) = brackets.iter().find(|bracket| bracket.job_level == plot_level) else {
+            panic!("plugin-path benchmark pool missing the level-{plot_level} regular bracket");
+        };
+        let expert_crafter = CrafterStats {
+            craftsmanship: stats.craftsmanship_high,
+            control: stats.control_high,
+            cp: stats.cp_high,
+            level: plot_level,
+            manipulation: true,
+            heart_and_soul: false,
+            quick_innovation: false,
+        };
+        let mut expert_recipes = RECIPES
+            .entries()
+            .filter(|(_, recipe)| {
+                let recipe_job_level = RLVLS[recipe.recipe_level as usize].job_level;
+                recipe.max_level_scaling == 0
+                    && recipe.is_expert
+                    && recipe_job_level >= recipe_low
+                    && recipe_job_level <= recipe_high
+                    && recipe.req_craftsmanship <= expert_crafter.craftsmanship
+                    && recipe.req_control <= expert_crafter.control
+            })
+            .map(|(recipe_id, recipe)| {
+                let settings = get_game_settings(*recipe, None, expert_crafter, None, None);
+                let recipe_level = RLVLS[recipe.recipe_level as usize];
+                PluginPathBenchmarkRecipe {
+                    recipe_id,
+                    item_id: recipe.item_id,
+                    req_craftsmanship: recipe.req_craftsmanship,
+                    req_control: recipe.req_control,
+                    recipe_job_level: recipe_level.job_level,
+                    recipe_level_table_id: recipe.recipe_level,
+                    expert: true,
+                    progress_div: recipe_level.progress_div,
+                    quality_div: recipe_level.quality_div,
+                    progress_mod: recipe_level.progress_mod,
+                    quality_mod: recipe_level.quality_mod,
+                    max_durability: settings.max_durability,
+                    max_progress: settings.max_progress,
+                    max_quality: settings.max_quality,
+                }
+            })
+            .collect::<Vec<_>>();
+        expert_recipes.sort_by_key(|recipe| (recipe.recipe_id, recipe.item_id));
+        assert!(
+            expert_recipes.len() >= 10,
+            "expert band {recipe_low}-{recipe_high} must contain at least 10 eligible recipes, actual={}",
+            expert_recipes.len()
+        );
+        expert_brackets.push(PluginPathBenchmarkBracket {
+            job_level: plot_level,
+            level_low: recipe_low,
+            craftsmanship_low: stats.craftsmanship_low,
+            craftsmanship_high: stats.craftsmanship_high,
+            control_low: stats.control_low,
+            control_high: stats.control_high,
+            cp_low: stats.cp_low,
+            cp_high: stats.cp_high,
+            recipes: expert_recipes,
+        });
+    }
+
+    PluginPathBenchmarkPool {
+        version: 1,
+        brackets,
+        expert_brackets,
+    }
+}
+
 fn real_fixtures(mode: Mode) -> Vec<RealFixture> {
     const CRAFTER_CURVE: [(u8, u16, u16, u16); 10] = [
         (10, 50, 45, 200),
@@ -1151,6 +1357,7 @@ fn main() {
     let mut expert_high = false;
     let mut summary_only = false;
     let mut emit_corpus = None;
+    let mut emit_benchmark_pool = None;
     let mut corpus_path = None;
     let mut reference_results_path = None;
     let mut comparison_output_path = None;
@@ -1175,6 +1382,13 @@ fn main() {
             "--initial-only" => INITIAL_ONLY.store(true, Ordering::Relaxed),
             "--emit-corpus" => {
                 emit_corpus = Some(arguments.next().expect("--emit-corpus requires a path"));
+            }
+            "--emit-plugin-path-benchmark-pool" => {
+                emit_benchmark_pool = Some(
+                    arguments
+                        .next()
+                        .expect("--emit-plugin-path-benchmark-pool requires a path"),
+                );
             }
             "--corpus" => {
                 corpus_path = Some(arguments.next().expect("--corpus requires a path"));
@@ -1201,7 +1415,7 @@ fn main() {
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: donatello-bench [--quick|--full] [--real|--expert-high] [--summary] [--json] [--output PATH] [--deadline-ms N] [--initial-only] [--filter TEXT] [--emit-corpus PATH|--corpus PATH] [--compare-reference PATH] [--comparison-output PATH]"
+                    "Usage: donatello-bench [--quick|--full] [--real|--expert-high] [--summary] [--json] [--output PATH] [--deadline-ms N] [--initial-only] [--filter TEXT] [--emit-corpus PATH|--corpus PATH] [--emit-plugin-path-benchmark-pool PATH] [--compare-reference PATH] [--comparison-output PATH]"
                 );
                 return;
             }
@@ -1210,6 +1424,12 @@ fn main() {
     }
 
     QUIET_FAILURES.store(summary_only, Ordering::Relaxed);
+    if let Some(path) = emit_benchmark_pool {
+        let mut bytes = serde_json::to_vec_pretty(&plugin_path_benchmark_pool()).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(path, bytes).expect("failed to write plugin-path benchmark pool");
+        return;
+    }
     let mut real_cases = real_fixtures(mode);
     if expert_high {
         real_cases.retain(|case| case.expert && case.job_level >= 90);
