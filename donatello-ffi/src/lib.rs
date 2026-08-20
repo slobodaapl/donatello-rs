@@ -207,6 +207,42 @@ struct SolveResult {
     final_state: FinalStateSummary,
 }
 
+#[derive(Clone, Copy)]
+struct LiveRootOffsets {
+    progress: u16,
+    quality: u16,
+    max_quality: u16,
+}
+
+impl LiveRootOffsets {
+    fn normalize(request: &mut CraftSolveRequest) -> Self {
+        let offsets = Self {
+            progress: request.root.progress,
+            quality: request.root.quality.min(request.max_quality),
+            max_quality: request.max_quality,
+        };
+        request.max_progress = request.max_progress.saturating_sub(offsets.progress);
+        request.max_quality = request.max_quality.saturating_sub(offsets.quality);
+        request.root.progress = 0;
+        request.root.quality = 0;
+        offsets
+    }
+
+    fn restore(self, mut result: SolveResult) -> SolveResult {
+        let residual_max_quality = self.max_quality.saturating_sub(self.quality);
+        let restore_quality = |quality: u16| {
+            self.quality
+                .saturating_add(quality.min(residual_max_quality))
+                .min(self.max_quality)
+        };
+        result.achieved_quality = restore_quality(result.achieved_quality);
+        result.quality_upper_bound = restore_quality(result.quality_upper_bound);
+        result.final_state.progress = self.progress.saturating_add(result.final_state.progress);
+        result.final_state.quality = restore_quality(result.final_state.quality);
+        result
+    }
+}
+
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProgressBoundary {
@@ -451,7 +487,7 @@ fn gabriel_json(data: &[u8]) -> String {
     serde_json::to_string(&response).unwrap()
 }
 
-fn solve(request: CraftSolveRequest, interrupt: AtomicFlag) -> Result<SolveResult, String> {
+fn solve(mut request: CraftSolveRequest, interrupt: AtomicFlag) -> Result<SolveResult, String> {
     configure_solver_workers();
     let started = std::time::Instant::now();
     if request.abi_version != ABI_VERSION {
@@ -463,6 +499,7 @@ fn solve(request: CraftSolveRequest, interrupt: AtomicFlag) -> Result<SolveResul
     if request.solve_mode > 2 {
         return Err(format!("unsupported solve mode {}", request.solve_mode));
     }
+    let live_root_offsets = LiveRootOffsets::normalize(&mut request);
     let current_condition = condition(request.root.condition)?;
     let allow_careful_observation = request.allow_careful_observation
         && request.specialist
@@ -548,7 +585,7 @@ fn solve(request: CraftSolveRequest, interrupt: AtomicFlag) -> Result<SolveResul
     {
         let final_state = evaluate_final_state(&settings, state, current_condition, &actions);
         let quality = final_state.quality;
-        return Ok(SolveResult {
+        return Ok(live_root_offsets.restore(SolveResult {
             action_ids: actions.into_iter().map(Action::action_id).collect(),
             optimal: true,
             deadline_reached: false,
@@ -557,7 +594,7 @@ fn solve(request: CraftSolveRequest, interrupt: AtomicFlag) -> Result<SolveResul
             elapsed_millis: started.elapsed().as_millis(),
             progress_boundary: None,
             final_state,
-        });
+        }));
     }
     let cached_solver = cached_solver(solver_settings);
     let mut solver = cached_solver
@@ -569,7 +606,7 @@ fn solve(request: CraftSolveRequest, interrupt: AtomicFlag) -> Result<SolveResul
     {
         let final_state = evaluate_final_state(&settings, state, current_condition, &actions);
         let quality = final_state.quality;
-        return Ok(SolveResult {
+        return Ok(live_root_offsets.restore(SolveResult {
             action_ids: actions.into_iter().map(Action::action_id).collect(),
             optimal: true,
             deadline_reached: false,
@@ -578,7 +615,7 @@ fn solve(request: CraftSolveRequest, interrupt: AtomicFlag) -> Result<SolveResul
             elapsed_millis: started.elapsed().as_millis(),
             progress_boundary: None,
             final_state,
-        });
+        }));
     }
     solver.set_interrupt_signal(interrupt.clone());
     let improved_solution = solver.improved_solution_signal();
@@ -644,7 +681,7 @@ fn solve(request: CraftSolveRequest, interrupt: AtomicFlag) -> Result<SolveResul
         cache_solution(cache_key, &outcome.actions);
     }
     let final_state = evaluate_final_state(&settings, state, current_condition, &outcome.actions);
-    Ok(SolveResult {
+    Ok(live_root_offsets.restore(SolveResult {
         action_ids: outcome.actions.into_iter().map(Action::action_id).collect(),
         optimal: outcome.optimal,
         deadline_reached: deadline_reached.load(std::sync::atomic::Ordering::Acquire),
@@ -653,7 +690,7 @@ fn solve(request: CraftSolveRequest, interrupt: AtomicFlag) -> Result<SolveResul
         elapsed_millis: started.elapsed().as_millis(),
         progress_boundary: outcome.progress_boundary,
         final_state,
-    })
+    }))
 }
 
 fn solve_macro(
@@ -1739,6 +1776,82 @@ mod tests {
         )
         .unwrap();
         assert!(final_state.progress >= 500);
+    }
+
+    #[test]
+    fn late_live_root_uses_residual_targets_and_restores_absolute_results() {
+        let request = CraftSolveRequest {
+            abi_version: ABI_VERSION,
+            max_cp: 711,
+            max_durability: 70,
+            max_progress: 10_040,
+            max_quality: 21_200,
+            base_progress: 301,
+            base_quality: 285,
+            job_level: 100,
+            manipulation: true,
+            specialist: true,
+            allow_careful_observation: false,
+            solve_mode: 2,
+            minimize_steps: false,
+            progress_first: false,
+            stellar_steady_hand_charges: 0,
+            incumbent_action_ids: vec![Action::CarefulSynthesis.action_id()],
+            soft_deadline_millis: 5_000,
+            hard_deadline_millis: 10_000,
+            reset_soft_deadline_on_improvement: true,
+            bypass_solution_cache: true,
+            root: RootState {
+                cp: 268,
+                durability: 5,
+                progress: 9_524,
+                quality: 16_764,
+                inner_quiet: 9,
+                waste_not: 0,
+                manipulation: 0,
+                innovation: 1,
+                veneration: 0,
+                great_strides: 0,
+                muscle_memory: 0,
+                final_appraisal: 0,
+                careful_observation_charges: 0,
+                combo: 0,
+                heart_and_soul_active: false,
+                heart_and_soul_available: false,
+                quick_innovation_available: false,
+                trained_perfection_active: false,
+                trained_perfection_available: false,
+                stellar_steady_hand_charges: 0,
+                stellar_steady_hand: 0,
+                splendor_cosmic: true,
+                expedience: false,
+                condition: Condition::Normal as u8,
+                crafter_delineations: 54,
+            },
+        };
+
+        let result = solve(request, AtomicFlag::new())
+            .expect("residual late-root optimization must produce a completion");
+        assert!(result.optimal, "late-root result was not proven optimal");
+        assert!(
+            !result.deadline_reached,
+            "late-root result hit its deadline"
+        );
+        assert_ne!(
+            result.action_ids,
+            vec![Action::CarefulSynthesis.action_id()],
+            "late-root optimization retained the below-maximum incumbent"
+        );
+        assert_eq!(result.achieved_quality, 21_200);
+        assert_eq!(result.quality_upper_bound, 21_200);
+        assert_eq!(result.final_state.quality, 21_200);
+        assert!(result.final_state.progress >= 10_040);
+        assert!(result.final_state.complete);
+        assert!(
+            result.elapsed_millis < 10_000,
+            "residual late-root solve took {} ms",
+            result.elapsed_millis
+        );
     }
 
     #[test]
