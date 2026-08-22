@@ -61,6 +61,7 @@ fn request(gp: u16, rewards: Vec<RewardTier>) -> SolveRequest {
             abandon_when_complete: false,
         },
         unsupported_reason: None,
+        plan_starting_gp: false,
     }
 }
 

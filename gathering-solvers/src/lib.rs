@@ -149,6 +149,8 @@ pub struct SolveRequest {
     pub legacy: LegacyOptions,
     #[serde(default)]
     pub unsupported_reason: Option<String>,
+    #[serde(default)]
+    pub plan_starting_gp: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -159,6 +161,10 @@ pub struct Decision {
     pub expected_reward: f64,
     pub expected_perfect_collects: f64,
     pub expected_terminal_gp: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimum_starting_gp: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gp_planning_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
 }
@@ -203,6 +209,18 @@ impl Value {
                             || ((self.terminal_gp - other.terminal_gp).abs() <= EPSILON
                                 && self.actions < other.actions - EPSILON)))))
     }
+
+    fn reaches_full_objective(self, full: Self, mode: SolverMode) -> bool {
+        const EPSILON: f64 = 1e-9;
+        match mode {
+            SolverMode::MaximizeCollectability => {
+                self.perfect_collects + EPSILON >= full.perfect_collects
+                    && self.reward + EPSILON >= full.reward
+            }
+            SolverMode::ExpectedScrip => self.reward + EPSILON >= full.reward,
+            SolverMode::Legacy => false,
+        }
+    }
 }
 
 pub fn solve(request: &SolveRequest) -> Result<Decision, String> {
@@ -216,15 +234,28 @@ pub fn solve(request: &SolveRequest) -> Result<Decision, String> {
         return legacy_decision(request, Some(reason.clone()));
     }
 
-    match ExpectedSolver::new(request).solve() {
-        Ok((action, value)) => Ok(Decision {
-            action,
-            solver_used: request.mode,
-            expected_reward: value.reward,
-            expected_perfect_collects: value.perfect_collects,
-            expected_terminal_gp: value.terminal_gp,
-            fallback_reason: None,
-        }),
+    let mut solver = ExpectedSolver::new(request);
+    match solver.solve_state(request.state) {
+        Ok((action, value)) => {
+            let (minimum_starting_gp, gp_planning_error) = if request.plan_starting_gp {
+                match solver.minimum_gp_for_full_objective(value) {
+                    Ok(gp) => (Some(gp), None),
+                    Err(error) => (None, Some(error)),
+                }
+            } else {
+                (None, None)
+            };
+            Ok(Decision {
+                action,
+                solver_used: request.mode,
+                expected_reward: value.reward,
+                expected_perfect_collects: value.perfect_collects,
+                expected_terminal_gp: value.terminal_gp,
+                minimum_starting_gp,
+                gp_planning_error,
+                fallback_reason: None,
+            })
+        }
         Err(reason) => legacy_decision(request, Some(reason)),
     }
 }
@@ -359,6 +390,8 @@ fn legacy_result(
         expected_reward: 0.0,
         expected_perfect_collects: 0.0,
         expected_terminal_gp: 0.0,
+        minimum_starting_gp: None,
+        gp_planning_error: None,
         fallback_reason,
     })
 }
@@ -378,15 +411,45 @@ impl<'a> ExpectedSolver<'a> {
         }
     }
 
-    fn solve(mut self) -> Result<(GatheringAction, Value), String> {
-        if self.request.state.remaining == 0 {
+    fn solve_state(&mut self, state: State) -> Result<(GatheringAction, Value), String> {
+        if state.remaining == 0 {
             return Err(String::from("requested quantity already satisfied"));
         }
-        let candidates = self.candidates(self.request.state)?;
-        candidates
-            .into_iter()
-            .max_by(|left, right| compare_candidates(*left, *right))
-            .ok_or_else(|| String::from("no legal collectable action"))
+        let decision = self
+            .best_candidate(state)?
+            .ok_or_else(|| String::from("no legal collectable action"))?;
+        self.memo.insert(state, decision.1);
+        Ok(decision)
+    }
+
+    fn minimum_gp_for_full_objective(&mut self, observed_value: Value) -> Result<u16, String> {
+        let mut full_state = self.request.state;
+        full_state.gp = full_state.max_gp;
+        let full_value = if self.request.state.gp == full_state.max_gp {
+            observed_value
+        } else {
+            self.value(full_state)?
+        };
+        let (mut low, mut high) =
+            if observed_value.reaches_full_objective(full_value, self.request.mode) {
+                (0, self.request.state.gp)
+            } else {
+                (self.request.state.gp.saturating_add(1), full_state.max_gp)
+            };
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let mut candidate_state = full_state;
+            candidate_state.gp = middle;
+            if self
+                .value(candidate_state)?
+                .reaches_full_objective(full_value, self.request.mode)
+            {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        Ok(low)
     }
 
     fn value(&mut self, state: State) -> Result<Value, String> {
@@ -406,9 +469,7 @@ impl<'a> ExpectedSolver<'a> {
             return Err(String::from("cyclic transition kernel"));
         }
         let result = self
-            .candidates(state)?
-            .into_iter()
-            .max_by(|left, right| compare_candidates(*left, *right))
+            .best_candidate(state)?
             .map(|(_, value)| value)
             .unwrap_or(Value {
                 terminal_gp: f64::from(state.gp),
@@ -419,8 +480,8 @@ impl<'a> ExpectedSolver<'a> {
         Ok(result)
     }
 
-    fn candidates(&mut self, state: State) -> Result<Vec<(GatheringAction, Value)>, String> {
-        let mut result = Vec::new();
+    fn best_candidate(&mut self, state: State) -> Result<Option<(GatheringAction, Value)>, String> {
+        let mut best = None;
         for action in ACTION_ORDER {
             if let Some(outcomes) = self.outcomes(state, action) {
                 let mut value = Value::default();
@@ -429,10 +490,15 @@ impl<'a> ExpectedSolver<'a> {
                     value.add(successor_value.after(probability, reward, perfect_collects));
                 }
                 value.actions += 1.0;
-                result.push((action, value));
+                let candidate = (action, value);
+                if best.is_none_or(|current| {
+                    compare_candidates(candidate, current) == std::cmp::Ordering::Greater
+                }) {
+                    best = Some(candidate);
+                }
             }
         }
-        Ok(result)
+        Ok(best)
     }
 
     fn outcomes(
@@ -611,12 +677,14 @@ impl<'a> ExpectedSolver<'a> {
                     for (standard_probability, standard_proc) in
                         probability_branches(mechanics.standard_proc_bp)
                     {
-                        let high_branches = if standard_proc {
-                            probability_branches(mechanics.high_standard_upgrade_bp)
+                        let high_standard_bp = if standard_proc {
+                            mechanics.high_standard_upgrade_bp
                         } else {
-                            vec![(1.0, false)]
+                            0
                         };
-                        for (high_probability, high_standard) in high_branches {
+                        for (high_probability, high_standard) in
+                            probability_branches(high_standard_bp)
+                        {
                             let mut next = state;
                             let intuition_gain = if intuition {
                                 mechanics.intuition_gain
@@ -791,18 +859,18 @@ fn probability(bp: u16) -> f64 {
     f64::from(bp) / 10_000.0
 }
 
-fn probability_branches(bp: u16) -> Vec<(f64, bool)> {
+fn probability_branches(bp: u16) -> impl Iterator<Item = (f64, bool)> {
     let success = probability(bp);
-    match bp {
-        0 => vec![(1.0, false)],
-        10_000 => vec![(1.0, true)],
-        _ => vec![(success, true), (1.0 - success, false)],
-    }
+    let (branches, length) = match bp {
+        0 => ([(1.0, false), (0.0, false)], 1),
+        10_000 => ([(1.0, true), (0.0, false)], 1),
+        _ => ([(success, true), (1.0 - success, false)], 2),
+    };
+    branches.into_iter().take(length)
 }
 
 fn binary_outcomes(bp: u16, success: State, failure: State) -> Vec<(f64, State, f64, f64)> {
     probability_branches(bp)
-        .into_iter()
         .map(|(probability, branch)| {
             (
                 probability,
@@ -910,6 +978,7 @@ mod tests {
                 abandon_when_complete: true,
             },
             unsupported_reason: None,
+            plan_starting_gp: false,
         }
     }
 
@@ -966,6 +1035,112 @@ mod tests {
             "with={} without={}",
             decision.expected_reward,
             without_preservation.expected_reward
+        );
+    }
+
+    #[test]
+    fn starting_gp_plan_returns_the_lowest_gp_matching_the_full_gp_reward() {
+        let mut input = request(vec![
+            RewardTier {
+                threshold: 500,
+                scrip: 10,
+            },
+            RewardTier {
+                threshold: 1000,
+                scrip: 100,
+            },
+        ]);
+        input.state.integrity = 2;
+        input.state.max_integrity = 2;
+        input.state.remaining = 1;
+        input.actions.scrutiny = true;
+        input.actions.scrutiny_cost = 200;
+        input.plan_starting_gp = true;
+
+        let decision = solve(&input).unwrap();
+
+        assert_eq!(decision.minimum_starting_gp, Some(200));
+        assert_eq!(decision.gp_planning_error, None);
+    }
+
+    #[test]
+    fn starting_gp_plan_is_optional() {
+        let decision = solve(&request(vec![RewardTier {
+            threshold: 500,
+            scrip: 10,
+        }]))
+        .unwrap();
+
+        assert_eq!(decision.minimum_starting_gp, None);
+        assert_eq!(decision.gp_planning_error, None);
+    }
+
+    #[test]
+    fn representative_stochastic_starting_gp_plan_stays_within_the_search_budget() {
+        let mut input = request(vec![
+            RewardTier {
+                threshold: 600,
+                scrip: 16,
+            },
+            RewardTier {
+                threshold: 800,
+                scrip: 23,
+            },
+            RewardTier {
+                threshold: 1000,
+                scrip: 38,
+            },
+        ]);
+        input.state.integrity = 6;
+        input.state.max_integrity = 6;
+        input.state.remaining = 6;
+        input.actions.scour_gain = 200;
+        input.actions.meticulous_gain = 150;
+        input.actions.scrutiny = true;
+        input.actions.meticulous = true;
+        input.actions.solid_reason = true;
+        input.actions.wise_to_the_world = true;
+        input.mechanics.intuition_bp = 4_000;
+        input.mechanics.standard_proc_bp = 2_000;
+        input.mechanics.high_standard_upgrade_bp = 2_000;
+        input.mechanics.meticulous_preserve_bp = 2_500;
+        input.mechanics.high_standard_preserve_bonus_bp = 4_000;
+        input.mechanics.max_states = 500_000;
+        input.plan_starting_gp = true;
+
+        let decision = solve(&input).unwrap();
+
+        assert_eq!(decision.minimum_starting_gp, Some(994));
+        assert_eq!(decision.gp_planning_error, None);
+    }
+
+    #[test]
+    fn optional_gp_planning_failure_preserves_the_observed_state_decision() {
+        let mut input = request(vec![
+            RewardTier {
+                threshold: 500,
+                scrip: 10,
+            },
+            RewardTier {
+                threshold: 1000,
+                scrip: 100,
+            },
+        ]);
+        input.state.collectability = 500;
+        input.state.integrity = 1;
+        input.state.max_integrity = 1;
+        input.actions.scrutiny = true;
+        input.mechanics.max_states = 0;
+        input.plan_starting_gp = true;
+
+        let decision = solve(&input).unwrap();
+
+        assert_eq!(decision.solver_used, SolverMode::ExpectedScrip);
+        assert_eq!(decision.action, GatheringAction::Collect);
+        assert_eq!(decision.minimum_starting_gp, None);
+        assert_eq!(
+            decision.gp_planning_error.as_deref(),
+            Some("gathering solver search budget exceeded")
         );
     }
 
