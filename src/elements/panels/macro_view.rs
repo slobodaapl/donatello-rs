@@ -518,7 +518,8 @@ mod tests {
             /ac "Rapid Synthesis" <wait.3>
             /ac "Hasty Touch" <wait.3>
             /ac "Hasty Touch" <wait.3>
-            /ac "Final Appraisal" <wait.3>"#]]
+            /ac "Final Appraisal" <wait.3>
+            /ac "Careful Observation" <wait.3>"#]]
         .assert_eq(&macros[2]);
     }
 

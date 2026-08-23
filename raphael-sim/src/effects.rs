@@ -75,11 +75,13 @@ impl Effects {
         };
         let effects = self
             .with_crafter_delineations(delineations)
-            .with_careful_observation_charges(if self.careful_observation_charges() < delineations {
-                self.careful_observation_charges()
-            } else {
-                delineations
-            });
+            .with_careful_observation_charges(
+                if self.careful_observation_charges() < delineations {
+                    self.careful_observation_charges()
+                } else {
+                    delineations
+                },
+            );
         if delineations == 0 {
             // Heart and Soul may already be active after its delineation was spent.
             effects

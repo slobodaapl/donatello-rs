@@ -3,8 +3,8 @@ use rayon::prelude::*;
 
 use super::search_queue::{SearchQueueStats, SearchScore};
 use crate::actions::{
-    ActionCombo, FULL_SEARCH_ACTIONS, final_appraisal_is_dominated,
-    stellar_window_transitions, use_action_combo, use_action_combo_with_condition,
+    ActionCombo, FULL_SEARCH_ACTIONS, final_appraisal_is_dominated, stellar_window_transitions,
+    use_action_combo, use_action_combo_with_condition,
 };
 use crate::finish_solver::{FinishSolverStats, Finishability};
 use crate::macro_solver::search_queue::{Batch, QueueCandidate, SearchQueue};
@@ -25,10 +25,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::vec::Vec;
 use strum::IntoEnumIterator;
 
+use super::FirstActionPreference;
+
 #[derive(Clone)]
 struct Solution {
     score: (SearchScore, u16),
     solver_actions: Vec<ActionCombo>,
+    first_action_preference: FirstActionPreference,
 }
 
 impl Solution {
@@ -238,11 +241,29 @@ impl<'a> MacroSolver<'a> {
         incumbent_actions: &[Action],
         minimize_steps: bool,
     ) -> Result<MacroSolveOutcome, SolverException> {
+        self.solve_from_state_with_condition_and_incumbent_anytime_preference(
+            initial_state,
+            condition,
+            incumbent_actions,
+            minimize_steps,
+            false,
+        )
+    }
+
+    pub fn solve_from_state_with_condition_and_incumbent_anytime_preference(
+        &mut self,
+        initial_state: SimulationState,
+        condition: Condition,
+        incumbent_actions: &[Action],
+        minimize_steps: bool,
+        prefer_quality_first: bool,
+    ) -> Result<MacroSolveOutcome, SolverException> {
         self.solve_from_state_with_condition_and_lanes_anytime(
             initial_state,
             condition,
             incumbent_actions,
             minimize_steps,
+            prefer_quality_first,
             None,
         )
     }
@@ -257,11 +278,31 @@ impl<'a> MacroSolver<'a> {
         minimize_steps: bool,
         prefixes: Vec<Vec<Action>>,
     ) -> Result<MacroSolveOutcome, SolverException> {
+        self.solve_from_state_with_condition_and_seeded_prefixes_anytime_preference(
+            initial_state,
+            condition,
+            incumbent_actions,
+            minimize_steps,
+            false,
+            prefixes,
+        )
+    }
+
+    pub fn solve_from_state_with_condition_and_seeded_prefixes_anytime_preference(
+        &mut self,
+        initial_state: SimulationState,
+        condition: Condition,
+        incumbent_actions: &[Action],
+        minimize_steps: bool,
+        prefer_quality_first: bool,
+        prefixes: Vec<Vec<Action>>,
+    ) -> Result<MacroSolveOutcome, SolverException> {
         self.solve_from_state_with_condition_and_lanes_anytime(
             initial_state,
             condition,
             incumbent_actions,
             minimize_steps,
+            prefer_quality_first,
             Some(prefixes),
         )
     }
@@ -272,6 +313,7 @@ impl<'a> MacroSolver<'a> {
         condition: Condition,
         incumbent_actions: &[Action],
         minimize_steps: bool,
+        prefer_quality_first: bool,
         seeded_prefixes: Option<Vec<Vec<Action>>>,
     ) -> Result<MacroSolveOutcome, SolverException> {
         log::debug!(
@@ -285,7 +327,12 @@ impl<'a> MacroSolver<'a> {
         let _total_time = ScopedTimer::new("Total Time");
 
         let seeded_only = seeded_prefixes.is_some();
-        let mut incumbent = self.incumbent_solution(initial_state, condition, incumbent_actions);
+        let mut incumbent = self.incumbent_solution(
+            initial_state,
+            condition,
+            incumbent_actions,
+            prefer_quality_first,
+        );
         if !seeded_only {
             let completion = self
                 .progress_frontier_cache
@@ -321,12 +368,16 @@ impl<'a> MacroSolver<'a> {
             };
             if let Some(actions) = completion {
                 let completion = self
-                    .incumbent_solution(initial_state, condition, &actions)
+                    .incumbent_solution(initial_state, condition, &actions, prefer_quality_first)
                     .expect("progress frontier returned a non-completing endpoint");
-                if incumbent
-                    .as_ref()
-                    .is_none_or(|current| completion.score > current.score)
-                {
+                if incumbent.as_ref().is_none_or(|current| {
+                    completion.score > current.score
+                        || prefer_quality_first
+                            && completion.score == current.score
+                            && completion
+                                .first_action_preference
+                                .strictly_preferred_to(current.first_action_preference)
+                }) {
                     incumbent = Some(completion);
                 }
             }
@@ -409,20 +460,34 @@ impl<'a> MacroSolver<'a> {
                 && cache.root == initial_state
                 && cache.condition == condition
             {
-                cache.one_short_prefixes = prefixes.clone();
+                cache.one_short_prefixes.clone_from(&prefixes);
                 cache.one_short_attempted = true;
             }
             prefixes
         };
 
         let timer = ScopedTimer::new("Search");
+        let search_queue = if seeded_only {
+            SearchQueue::seeded(
+                self.settings,
+                initial_state,
+                condition,
+                prefer_quality_first,
+            )
+        } else {
+            SearchQueue::new(
+                self.settings,
+                initial_state,
+                condition,
+                prefer_quality_first,
+            )
+        };
         let (solution, optimal, quality_upper_bound) = self.do_solve(
-            initial_state,
-            condition,
+            search_queue,
             incumbent,
             one_short_prefixes,
             minimize_steps,
-            !seeded_only,
+            prefer_quality_first,
         )?;
         drop(timer);
 
@@ -468,13 +533,16 @@ impl<'a> MacroSolver<'a> {
         mut state: SimulationState,
         mut condition: Condition,
         actions: &[Action],
+        prefer_quality_first: bool,
     ) -> Option<Solution> {
         let mut solver_actions = Vec::with_capacity(actions.len());
         let mut duration = 0_u8;
+        let mut first_action_preference = FirstActionPreference::Other;
         for &action in actions {
             if state.is_final(&self.settings.simulator_settings) {
                 break;
             }
+            let previous = state;
             (state, condition) = use_action_combo_with_condition(
                 &self.settings,
                 state,
@@ -482,6 +550,15 @@ impl<'a> MacroSolver<'a> {
                 condition,
             )
             .ok()?;
+            if prefer_quality_first && solver_actions.is_empty() {
+                first_action_preference = if state.quality > previous.quality {
+                    FirstActionPreference::Quality
+                } else if state.progress > previous.progress {
+                    FirstActionPreference::Progress
+                } else {
+                    FirstActionPreference::Other
+                };
+            }
             duration = duration.checked_add(action.time_cost())?;
             solver_actions.push(ActionCombo::Single(action));
         }
@@ -499,23 +576,18 @@ impl<'a> MacroSolver<'a> {
         Some(Solution {
             score: (score, 0),
             solver_actions,
+            first_action_preference,
         })
     }
 
     fn do_solve(
         &mut self,
-        state: SimulationState,
-        condition: Condition,
+        mut search_queue: SearchQueue,
         incumbent: Option<Solution>,
         one_short_prefixes: Vec<Vec<Action>>,
         minimize_steps: bool,
-        include_anchor: bool,
+        prefer_quality_first: bool,
     ) -> Result<(Solution, bool, u16), SolverException> {
-        let mut search_queue = if include_anchor {
-            SearchQueue::new(self.settings, state, condition)
-        } else {
-            SearchQueue::seeded(self.settings, state, condition)
-        };
         for prefix in one_short_prefixes {
             let current_steps = u8::try_from(prefix.len()).unwrap_or(u8::MAX);
             let current_duration = prefix.iter().fold(0_u8, |duration, action| {
@@ -536,6 +608,8 @@ impl<'a> MacroSolver<'a> {
         if !minimize_steps
             && solution.as_ref().is_some_and(|solution| {
                 solution.score.0.quality_upper_bound >= self.settings.max_quality()
+                    && (!prefer_quality_first
+                        || solution.first_action_preference != FirstActionPreference::Progress)
             })
         {
             let solution = solution.unwrap();
@@ -546,7 +620,13 @@ impl<'a> MacroSolver<'a> {
                 solution.score.0
             } else {
                 SearchScore {
-                    quality_upper_bound: solution.score.0.quality_upper_bound.saturating_add(1),
+                    quality_upper_bound: if prefer_quality_first
+                        && solution.first_action_preference == FirstActionPreference::Progress
+                    {
+                        solution.score.0.quality_upper_bound
+                    } else {
+                        solution.score.0.quality_upper_bound.saturating_add(1)
+                    },
                     ..SearchScore::MIN
                 }
             }
@@ -581,7 +661,15 @@ impl<'a> MacroSolver<'a> {
                 .try_fold(
                     create_worker_data,
                     |mut worker_data, (state, condition, backtrack_id)| {
-                        worker_data.process_state(state, condition, score, backtrack_id)?;
+                        let first_action_preference =
+                            search_queue.retained_first_action_preference(backtrack_id);
+                        worker_data.process_state(
+                            state,
+                            condition,
+                            score,
+                            backtrack_id,
+                            first_action_preference,
+                        )?;
                         Ok(worker_data)
                     },
                 )
@@ -608,7 +696,15 @@ impl<'a> MacroSolver<'a> {
                         || worker_solution.score.0.quality_upper_bound
                             > solution.as_ref().unwrap().score.0.quality_upper_bound
                         || (minimize_steps
-                            && Some(worker_solution.score) > solution.as_ref().map(|s| s.score)))
+                            && Some(worker_solution.score) > solution.as_ref().map(|s| s.score))
+                        || (prefer_quality_first
+                            && Some(worker_solution.score.0)
+                                == solution.as_ref().map(|s| s.score.0)
+                            && worker_solution
+                                .first_action_preference
+                                .strictly_preferred_to(
+                                    solution.as_ref().unwrap().first_action_preference,
+                                )))
                 {
                     solution = Some(worker_solution.clone());
                     self.complete_solution_found.store(true, Ordering::Release);
@@ -628,6 +724,8 @@ impl<'a> MacroSolver<'a> {
                 }
                 if solution.as_ref().is_some_and(|solution| {
                     solution.score.0.quality_upper_bound >= self.settings.max_quality()
+                        && (!prefer_quality_first
+                            || solution.first_action_preference != FirstActionPreference::Progress)
                 }) {
                     break;
                 }
@@ -745,18 +843,25 @@ impl WorkerData<'_> {
         score: SearchScore,
         transition_actions: SmallVec<[ActionCombo; 4]>,
         parent_id: usize,
+        first_action_preference: FirstActionPreference,
     ) {
         if state.progress >= self.settings.max_progress() {
             if self
                 .best_intermediate_solution
                 .as_ref()
-                .is_none_or(|solution| solution.score < (score, state.quality))
+                .is_none_or(|solution| {
+                    solution.score < (score, state.quality)
+                        || solution.score == (score, state.quality)
+                            && first_action_preference
+                                .strictly_preferred_to(solution.first_action_preference)
+                })
             {
                 let mut actions = self.search_queue.get_actions_from_node_idx(parent_id);
                 actions.extend_from_slice(&transition_actions);
                 self.best_intermediate_solution = Some(Solution {
                     score: (score, state.quality),
                     solver_actions: actions.into_vec(),
+                    first_action_preference,
                 });
             }
         } else if score >= self.min_accepted_score {
@@ -774,6 +879,7 @@ impl WorkerData<'_> {
         condition: Condition,
         score: SearchScore,
         backtrack_id: usize,
+        first_action_preference: FirstActionPreference,
     ) -> Result<(), SolverException> {
         if self.interrupt_signal.is_set() {
             return Err(SolverException::Interrupted);
@@ -785,11 +891,7 @@ impl WorkerData<'_> {
                 .filter(|action| !action.is_stellar_window_action())
                 .filter(|action| {
                     *action != ActionCombo::Single(Action::FinalAppraisal)
-                        || !final_appraisal_is_dominated(
-                            self.settings,
-                            state,
-                            Condition::Normal,
-                        )
+                        || !final_appraisal_is_dominated(self.settings, state, Condition::Normal)
                 })
             {
                 if let Ok(state) = use_action_combo(self.settings, state, action) {
@@ -799,6 +901,7 @@ impl WorkerData<'_> {
                         score,
                         smallvec![action],
                         backtrack_id,
+                        first_action_preference,
                     )?;
                 }
             }
@@ -822,6 +925,7 @@ impl WorkerData<'_> {
                         score,
                         smallvec![action],
                         backtrack_id,
+                        first_action_preference,
                     )?;
                 }
             }
@@ -833,6 +937,7 @@ impl WorkerData<'_> {
                 score,
                 transition.actions,
                 backtrack_id,
+                first_action_preference,
             )?;
         }
         Ok(())
@@ -845,6 +950,7 @@ impl WorkerData<'_> {
         score: SearchScore,
         actions: SmallVec<[ActionCombo; 4]>,
         backtrack_id: usize,
+        first_action_preference: FirstActionPreference,
     ) -> Result<(), SolverException> {
         let transition_steps = actions.iter().map(|action| action.steps()).sum::<u8>();
         let transition_duration = actions.iter().map(|action| action.duration()).sum::<u8>();
@@ -860,7 +966,13 @@ impl WorkerData<'_> {
                     current_duration,
                 };
                 self.update_min_score(solution_score);
-                self.add_candidate_state(state, solution_score, actions, backtrack_id);
+                self.add_candidate_state(
+                    state,
+                    solution_score,
+                    actions,
+                    backtrack_id,
+                    first_action_preference,
+                );
             }
             return Ok(());
         }
@@ -874,7 +986,13 @@ impl WorkerData<'_> {
                 current_steps,
                 current_duration,
             };
-            self.add_candidate_state(state, child_score, actions, backtrack_id);
+            self.add_candidate_state(
+                state,
+                child_score,
+                actions,
+                backtrack_id,
+                first_action_preference,
+            );
             return Ok(());
         }
 
@@ -921,7 +1039,13 @@ impl WorkerData<'_> {
             current_steps,
             current_duration,
         };
-        self.add_candidate_state(state, child_score, actions, backtrack_id);
+        self.add_candidate_state(
+            state,
+            child_score,
+            actions,
+            backtrack_id,
+            first_action_preference,
+        );
         Ok(())
     }
 }

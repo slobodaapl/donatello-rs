@@ -1198,8 +1198,7 @@ fn compute_planner_legal(model: &RecipeModel, state: State, action: usize) -> bo
     if matches!(
         action,
         FINAL_APPRAISAL | TRAINED_EYE | CAREFUL_OBSERVATION | QUICK_INNOVATION
-    )
-        || model.status(state) != TerminalStatus::Active
+    ) || model.status(state) != TerminalStatus::Active
     {
         return false;
     }

@@ -143,6 +143,52 @@ fn quality_only_replan_returns_a_max_quality_incumbent_without_search() {
 }
 
 #[test]
+fn expert_preference_moves_quality_before_progress_on_an_exact_tie() {
+    let settings = Settings {
+        max_cp: 18,
+        max_durability: 30,
+        max_progress: 200,
+        max_quality: 100,
+        base_progress: 100,
+        base_quality: 100,
+        job_level: 5,
+        allowed_actions: ActionMask::none()
+            .add(Action::BasicSynthesis)
+            .add(Action::BasicTouch),
+        adversarial: false,
+        backload_progress: false,
+        stellar_steady_hand_charges: 0,
+    };
+    let root = SimulationState::new(&settings);
+    let progress_first = [
+        Action::BasicSynthesis,
+        Action::BasicTouch,
+        Action::BasicSynthesis,
+    ];
+    let outcome = solver(settings)
+        .solve_from_state_with_condition_and_incumbent_anytime_preference(
+            root,
+            Condition::Centered,
+            &progress_first,
+            false,
+            true,
+        )
+        .unwrap();
+
+    assert!(outcome.optimal);
+    assert_eq!(
+        outcome.actions,
+        [
+            Action::BasicTouch,
+            Action::BasicSynthesis,
+            Action::BasicSynthesis,
+        ],
+        "{:?}",
+        outcome.stats,
+    );
+}
+
+#[test]
 fn every_supported_prefix_rejoins_normal_search_without_bound_failure() {
     let mut settings = settings(
         ActionMask::none()

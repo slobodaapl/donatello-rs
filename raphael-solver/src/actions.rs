@@ -1,5 +1,5 @@
-use smallvec::SmallVec;
 use raphael_sim::*;
+use smallvec::SmallVec;
 
 use crate::SolverSettings;
 

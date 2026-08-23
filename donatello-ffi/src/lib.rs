@@ -15,13 +15,13 @@ use raphael_solver::{
 };
 use serde::{Deserialize, Serialize};
 
-const ABI_VERSION: u32 = 12;
+const ABI_VERSION: u32 = 13;
 const DEFAULT_CACHE_BUDGET: usize = 512 * 1024 * 1024;
 const DEFAULT_GABRIEL_WORKER_THREADS: usize = 4;
 
 type CachedSolver = Arc<Mutex<MacroSolver<'static>>>;
 static SOLVER_CACHE: OnceLock<Mutex<SolverCache>> = OnceLock::new();
-type SolutionCacheKey = (SolverSettings, SimulationState, Condition, bool, u8);
+type SolutionCacheKey = (SolverSettings, SimulationState, Condition, bool, u8, bool);
 static SOLUTION_CACHE: OnceLock<Mutex<SolutionCache>> = OnceLock::new();
 static CACHE_BUDGET: AtomicUsize = AtomicUsize::new(DEFAULT_CACHE_BUDGET);
 static SOLVER_WORKERS: OnceLock<usize> = OnceLock::new();
@@ -59,6 +59,8 @@ struct CraftSolveRequest {
     minimize_steps: bool,
     #[serde(default)]
     progress_first: bool,
+    #[serde(default)]
+    prefer_quality_first: bool,
     #[serde(default)]
     stellar_steady_hand_charges: u8,
     #[serde(default)]
@@ -578,6 +580,7 @@ fn solve(mut request: CraftSolveRequest, interrupt: AtomicFlag) -> Result<SolveR
         current_condition,
         request.minimize_steps,
         request.solve_mode,
+        request.prefer_quality_first,
     );
     if request.solve_mode == 0
         && !request.bypass_solution_cache
@@ -643,6 +646,7 @@ fn solve(mut request: CraftSolveRequest, interrupt: AtomicFlag) -> Result<SolveR
                 state,
                 current_condition,
                 request.minimize_steps,
+                request.prefer_quality_first,
                 interrupt.clone(),
             )
         }
@@ -652,13 +656,15 @@ fn solve(mut request: CraftSolveRequest, interrupt: AtomicFlag) -> Result<SolveR
             current_condition,
             &incumbent,
             request.minimize_steps,
+            request.prefer_quality_first,
         ),
         _ => solver
-            .solve_from_state_with_condition_and_incumbent_anytime(
+            .solve_from_state_with_condition_and_incumbent_anytime_preference(
                 state,
                 current_condition,
                 &incumbent,
                 request.minimize_steps,
+                request.prefer_quality_first,
             )
             .map(|outcome| SolvePlan {
                 actions: outcome.actions,
@@ -699,13 +705,15 @@ fn solve_macro(
     condition: Condition,
     incumbent: &[Action],
     minimize_steps: bool,
+    prefer_quality_first: bool,
 ) -> Result<SolvePlan, String> {
     solver
-        .solve_from_state_with_condition_and_incumbent_anytime(
+        .solve_from_state_with_condition_and_incumbent_anytime_preference(
             state,
             condition,
             incumbent,
             minimize_steps,
+            prefer_quality_first,
         )
         .map(|outcome| SolvePlan {
             actions: outcome.actions,
@@ -730,6 +738,7 @@ fn solve_staged_progress(
     state: SimulationState,
     condition: Condition,
     minimize_steps: bool,
+    prefer_quality_first: bool,
     interrupt: AtomicFlag,
 ) -> Result<SolvePlan, String> {
     let mut prefixes = Vec::new();
@@ -838,11 +847,12 @@ fn solve_staged_progress(
         .map(|prefix| prefix.actions.clone())
         .collect::<Vec<_>>();
     let outcome = solver
-        .solve_from_state_with_condition_and_seeded_prefixes_anytime(
+        .solve_from_state_with_condition_and_seeded_prefixes_anytime_preference(
             state,
             condition,
             &incumbent,
             minimize_steps,
+            prefer_quality_first,
             seeded_actions.clone(),
         )
         .map_err(|error| format!("{error:?}"))?;
@@ -1795,6 +1805,7 @@ mod tests {
             solve_mode: 2,
             minimize_steps: false,
             progress_first: false,
+            prefer_quality_first: false,
             stellar_steady_hand_charges: 0,
             incumbent_action_ids: vec![Action::CarefulSynthesis.action_id()],
             soft_deadline_millis: 5_000,
@@ -2036,6 +2047,7 @@ mod tests {
                 allow_careful_observation: false,
                 solve_mode: 2,
                 progress_first: false,
+                prefer_quality_first: false,
                 minimize_steps: false,
                 stellar_steady_hand_charges: 0,
                 incumbent_action_ids: Vec::new(),
@@ -2082,7 +2094,7 @@ mod tests {
 
     #[test]
     fn abi_version_is_stable() {
-        assert_eq!(donatello_abi_version(), 12);
+        assert_eq!(donatello_abi_version(), 13);
     }
 
     #[test]

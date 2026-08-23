@@ -10,7 +10,7 @@ use crate::{
     actions::{ActionCombo, use_action_combo, use_action_combo_with_condition},
 };
 
-use super::pareto_front::ParetoFront;
+use super::{FirstActionPreference, pareto_front::ParetoFront};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SearchScore {
@@ -96,12 +96,15 @@ pub struct SearchQueueStats {
 pub struct SearchQueue {
     settings: SolverSettings,
     pareto_fronts: FxHashMap<Condition, ParetoFront>,
+    preferred_pareto_fronts: Option<FxHashMap<(Condition, FirstActionPreference), ParetoFront>>,
     batch_ordering: BTreeSet<SearchScore>,
     batches: FxHashMap<SearchScore, Vec<SearchNode>>,
     visited_nodes: Vec<SearchNode>,
     /// Cached reconstructed states aligned with `visited_nodes`. Survivors store
     /// the live `(state, condition)`; prefix-only nodes are `None`.
     visited_states: Vec<Option<(SimulationState, Condition)>>,
+    visited_first_action_preferences: Option<Vec<FirstActionPreference>>,
+    visited_has_action: Option<Vec<bool>>,
     num_inserted_nodes: usize,
     initial_state: SimulationState,
     initial_condition: Condition,
@@ -112,27 +115,43 @@ impl SearchQueue {
         settings: SolverSettings,
         initial_state: SimulationState,
         initial_condition: Condition,
+        prefer_quality_first: bool,
     ) -> Self {
-        Self::with_anchor(settings, initial_state, initial_condition, true)
+        Self::with_anchor(
+            settings,
+            initial_state,
+            initial_condition,
+            prefer_quality_first,
+            true,
+        )
     }
 
     pub(crate) fn seeded(
         settings: SolverSettings,
         initial_state: SimulationState,
         initial_condition: Condition,
+        prefer_quality_first: bool,
     ) -> Self {
-        Self::with_anchor(settings, initial_state, initial_condition, false)
+        Self::with_anchor(
+            settings,
+            initial_state,
+            initial_condition,
+            prefer_quality_first,
+            false,
+        )
     }
 
     fn with_anchor(
         settings: SolverSettings,
         initial_state: SimulationState,
         initial_condition: Condition,
+        prefer_quality_first: bool,
         include_anchor: bool,
     ) -> Self {
         let mut search_queue = Self {
             settings,
             pareto_fronts: FxHashMap::default(),
+            preferred_pareto_fronts: prefer_quality_first.then(FxHashMap::default),
             batch_ordering: BTreeSet::default(),
             batches: FxHashMap::default(),
             visited_nodes: vec![
@@ -141,6 +160,9 @@ impl SearchQueue {
                     .with_action(ActionCombo::None),
             ],
             visited_states: vec![Some((initial_state, initial_condition))],
+            visited_first_action_preferences: prefer_quality_first
+                .then(|| vec![FirstActionPreference::Other]),
+            visited_has_action: prefer_quality_first.then(|| vec![false]),
             num_inserted_nodes: 0,
             initial_state,
             initial_condition,
@@ -159,11 +181,13 @@ impl SearchQueue {
     ) -> Result<(), SolverException> {
         let mut parent_idx = 0;
         for &action in actions {
+            let first_action_preference =
+                self.first_action_preference(parent_idx, ActionCombo::Single(action));
             let node = SearchNode::new()
                 .with_parent_idx_checked(parent_idx)
                 .map_err(|_| SolverException::SearchQueueCapacityExceeded)?
                 .with_action(ActionCombo::Single(action));
-            self.push_visited(node, None);
+            self.push_visited(node, None, first_action_preference);
             parent_idx = self.visited_nodes.len() - 1;
         }
         self.push(score, ActionCombo::None, parent_idx)
@@ -236,11 +260,12 @@ impl SearchQueue {
             .split_last()
             .expect("search transitions must contain at least one action");
         for &action in prefix {
+            let first_action_preference = self.first_action_preference(parent_idx, action);
             let node = SearchNode::new()
                 .with_parent_idx_checked(parent_idx)
                 .map_err(|_| SolverException::SearchQueueCapacityExceeded)?
                 .with_action(action);
-            self.push_visited(node, None);
+            self.push_visited(node, None, first_action_preference);
             parent_idx = self.visited_nodes.len() - 1;
         }
         SearchNode::new()
@@ -277,23 +302,52 @@ impl SearchQueue {
                 .collect();
             // Prefix phase is part of state identity. Once Normal is reached, all paths share the
             // same Pareto front and collapse into Raphael's ordinary state space.
-            let mut by_condition = FxHashMap::<Condition, Vec<_>>::default();
-            for node in batch {
-                by_condition.entry(node.2).or_default().push(node);
-            }
             let mut non_dominated_nodes = Vec::new();
-            for (condition, nodes) in by_condition {
-                non_dominated_nodes.extend(
-                    self.pareto_fronts
-                        .entry(condition)
+            if self.preferred_pareto_fronts.is_some() {
+                let mut by_condition_and_preference =
+                    FxHashMap::<(Condition, FirstActionPreference), Vec<_>>::default();
+                for node in batch {
+                    let preference =
+                        self.first_action_preference(node.0.parent_idx(), node.0.action());
+                    by_condition_and_preference
+                        .entry((node.2, preference))
                         .or_default()
-                        .insert_batch(
-                            nodes,
-                            |expanded_node| &expanded_node.1,
-                            score.current_steps,
-                            score.current_duration,
-                        ),
-                );
+                        .push(node);
+                }
+                let Some(preferred_pareto_fronts) = self.preferred_pareto_fronts.as_mut() else {
+                    unreachable!("preferred Pareto fronts were checked above");
+                };
+                for (key, nodes) in by_condition_and_preference {
+                    non_dominated_nodes.extend(
+                        preferred_pareto_fronts
+                            .entry(key)
+                            .or_default()
+                            .insert_batch(
+                                nodes,
+                                |expanded_node| &expanded_node.1,
+                                score.current_steps,
+                                score.current_duration,
+                            ),
+                    );
+                }
+            } else {
+                let mut by_condition = FxHashMap::<Condition, Vec<_>>::default();
+                for node in batch {
+                    by_condition.entry(node.2).or_default().push(node);
+                }
+                for (condition, nodes) in by_condition {
+                    non_dominated_nodes.extend(
+                        self.pareto_fronts
+                            .entry(condition)
+                            .or_default()
+                            .insert_batch(
+                                nodes,
+                                |expanded_node| &expanded_node.1,
+                                score.current_steps,
+                                score.current_duration,
+                            ),
+                    );
+                }
             }
             let batch = Batch {
                 score,
@@ -308,9 +362,14 @@ impl SearchQueue {
                     .collect(),
             };
             for expanded_node in non_dominated_nodes {
+                let first_action_preference = self.first_action_preference(
+                    expanded_node.0.parent_idx(),
+                    expanded_node.0.action(),
+                );
                 self.push_visited(
                     expanded_node.0,
                     Some((expanded_node.1, expanded_node.2)),
+                    first_action_preference,
                 );
             }
             Some(batch)
@@ -323,10 +382,68 @@ impl SearchQueue {
         &mut self,
         node: SearchNode,
         state: Option<(SimulationState, Condition)>,
+        first_action_preference: FirstActionPreference,
     ) {
         self.visited_nodes.push(node);
         self.visited_states.push(state);
+        if let Some(preferences) = self.visited_first_action_preferences.as_mut() {
+            preferences.push(first_action_preference);
+        }
+        if let Some(has_action) = self.visited_has_action.as_mut() {
+            has_action.push(has_action[node.parent_idx()] || !node.action().actions().is_empty());
+        }
         debug_assert_eq!(self.visited_nodes.len(), self.visited_states.len());
+        debug_assert!(
+            self.visited_first_action_preferences
+                .as_ref()
+                .is_none_or(|preferences| self.visited_nodes.len() == preferences.len())
+        );
+        debug_assert!(
+            self.visited_has_action
+                .as_ref()
+                .is_none_or(|has_action| self.visited_nodes.len() == has_action.len())
+        );
+    }
+
+    fn first_action_preference(
+        &self,
+        parent_idx: usize,
+        action: ActionCombo,
+    ) -> FirstActionPreference {
+        let Some(has_action) = self.visited_has_action.as_ref() else {
+            return FirstActionPreference::Other;
+        };
+        if has_action[parent_idx] {
+            return self.visited_first_action_preferences.as_ref().unwrap()[parent_idx];
+        }
+        let Some(&first_action) = action.actions().first() else {
+            return FirstActionPreference::Other;
+        };
+        let Ok(next) = self.initial_state.use_action(
+            first_action,
+            self.initial_condition,
+            &self.settings.simulator_settings,
+        ) else {
+            return FirstActionPreference::Other;
+        };
+        if next.quality > self.initial_state.quality {
+            FirstActionPreference::Quality
+        } else if next.progress > self.initial_state.progress {
+            FirstActionPreference::Progress
+        } else {
+            FirstActionPreference::Other
+        }
+    }
+
+    pub(super) fn retained_first_action_preference(
+        &self,
+        node_idx: usize,
+    ) -> FirstActionPreference {
+        self.visited_first_action_preferences
+            .as_ref()
+            .map_or(FirstActionPreference::Other, |preferences| {
+                preferences[node_idx]
+            })
     }
 
     fn reconstruct_node(&self, node: SearchNode) -> (SimulationState, Condition) {
@@ -427,7 +544,7 @@ mod tests {
                 .with_heart_and_soul_available(true),
             ..SimulationState::new(&settings.simulator_settings)
         };
-        let mut queue = SearchQueue::new(settings, root, Condition::Excellent);
+        let mut queue = SearchQueue::new(settings, root, Condition::Excellent, false);
         let initial = queue.pop_batch().unwrap().nodes[0];
         assert_eq!(initial.1, Condition::Excellent);
 
@@ -469,7 +586,7 @@ mod tests {
         let mut settings = settings();
         settings.simulator_settings.stellar_steady_hand_charges = 1;
         let root = SimulationState::new(&settings.simulator_settings);
-        let mut queue = SearchQueue::new(settings, root, Condition::Normal);
+        let mut queue = SearchQueue::new(settings, root, Condition::Normal, false);
         let anchor = queue.pop_batch().unwrap().nodes[0];
         let actions = [
             ActionCombo::Single(Action::StellarSteadyHand),
@@ -503,7 +620,7 @@ mod tests {
     fn seeded_prefix_does_not_replace_unrestricted_anchor() {
         let settings = settings();
         let root = SimulationState::new(&settings.simulator_settings);
-        let mut queue = SearchQueue::new(settings, root, Condition::Normal);
+        let mut queue = SearchQueue::new(settings, root, Condition::Normal, false);
         queue
             .seed_prefix(
                 &[Action::BasicSynthesis],

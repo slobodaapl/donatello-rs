@@ -197,8 +197,8 @@ fn pactmaker_3240_3130_heart_and_soul() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 45189,
-                processed_nodes: 2422,
+                inserted_nodes: 44959,
+                processed_nodes: 2403,
             },
             finish_solver_stats: FinishSolverStats {
                 states: 15924,
@@ -963,8 +963,8 @@ fn hardened_survey_plank_5558_5216_heart_and_soul_quick_innovation() {
     let expected_runtime_stats = expect![[r#"
         MacroSolverStats {
             search_queue_stats: SearchQueueStats {
-                inserted_nodes: 1342174,
-                processed_nodes: 115465,
+                inserted_nodes: 1328940,
+                processed_nodes: 114550,
             },
             finish_solver_stats: FinishSolverStats {
                 states: 10857,

@@ -926,7 +926,10 @@ impl ActionImpl for CarefulObservation {
 
     fn transform(state: &mut SimulationState, _settings: &Settings, _condition: Condition) {
         state.effects.set_careful_observation_charges(
-            state.effects.careful_observation_charges().saturating_sub(1),
+            state
+                .effects
+                .careful_observation_charges()
+                .saturating_sub(1),
         );
         state
             .effects

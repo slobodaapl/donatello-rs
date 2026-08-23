@@ -408,7 +408,9 @@ fn solve_runtime_ffi_staged(
     ))
     .map_err(|error| error.to_string())?;
     if !response.ok {
-        return Err(response.error.unwrap_or_else(|| String::from("unknown FFI solve failure")));
+        return Err(response
+            .error
+            .unwrap_or_else(|| String::from("unknown FFI solve failure")));
     }
     let actions = response
         .action_ids
@@ -863,9 +865,8 @@ fn run_case(
                 finish_deadline(deadline_done, deadline_worker);
                 result
             };
-            let (optimal, quality_bound_gap, _staged_progress_plan) = solved
-                .as_ref()
-                .map_or((false, 0, false), |outcome| {
+            let (optimal, quality_bound_gap, _staged_progress_plan) =
+                solved.as_ref().map_or((false, 0, false), |outcome| {
                     (
                         outcome.optimal,
                         outcome.quality_bound_gap,
@@ -1044,7 +1045,10 @@ fn plugin_path_benchmark_pool() -> PluginPathBenchmarkPool {
     let expert_bands = [(80u8, 80u8, 89u8), (90, 90, 99), (100, 100, 100)];
     let mut expert_brackets = Vec::with_capacity(expert_bands.len());
     for (plot_level, recipe_low, recipe_high) in expert_bands {
-        let Some(stats) = brackets.iter().find(|bracket| bracket.job_level == plot_level) else {
+        let Some(stats) = brackets
+            .iter()
+            .find(|bracket| bracket.job_level == plot_level)
+        else {
             panic!("plugin-path benchmark pool missing the level-{plot_level} regular bracket");
         };
         let expert_crafter = CrafterStats {
@@ -1268,7 +1272,10 @@ fn real_fixtures(mode: Mode) -> Vec<RealFixture> {
                 name: if recipe_id == 38202 {
                     String::from("recipe38202-logged-stats")
                 } else {
-                    format!("L{job_level}-expert-recipe{recipe_id}-item{}", recipe.item_id)
+                    format!(
+                        "L{job_level}-expert-recipe{recipe_id}-item{}",
+                        recipe.item_id
+                    )
                 },
                 recipe_id,
                 item_id: recipe.item_id,
@@ -1724,10 +1731,7 @@ mod tests {
                 "level-{level} expert recipes"
             );
         }
-        let experts = cases
-            .iter()
-            .filter(|case| case.expert)
-            .collect::<Vec<_>>();
+        let experts = cases.iter().filter(|case| case.expert).collect::<Vec<_>>();
         assert!(
             experts
                 .iter()
