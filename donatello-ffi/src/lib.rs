@@ -348,14 +348,15 @@ fn build_gabriel_model(
     }
     let mut allowed_actions = ActionMask::all()
         .remove(Action::TrainedEye)
-        .remove(Action::StellarSteadyHand)
-        .remove(Action::CarefulObservation)
-        .remove(Action::QuickInnovation);
+        .remove(Action::StellarSteadyHand);
     if !request.manipulation {
         allowed_actions = allowed_actions.remove(Action::Manipulation);
     }
     if !request.specialist {
-        allowed_actions = allowed_actions.remove(Action::HeartAndSoul);
+        allowed_actions = allowed_actions
+            .remove(Action::CarefulObservation)
+            .remove(Action::HeartAndSoul)
+            .remove(Action::QuickInnovation);
     }
     let settings = Settings {
         max_cp: request.max_cp,
@@ -1592,17 +1593,17 @@ mod tests {
     }
 
     #[test]
-    fn gabriel_excludes_forbidden_specialist_actions_even_when_available() {
+    fn gabriel_enables_supported_specialist_actions_only_for_specialists() {
         let request: GabrielSolveRequest = serde_json::from_slice(&gabriel_request()).unwrap();
         let (model, state) = build_gabriel_model(&request).unwrap();
 
         assert!(
-            !model
+            model
                 .settings
                 .allowed_actions
                 .has(Action::CarefulObservation)
         );
-        assert!(!model.settings.allowed_actions.has(Action::QuickInnovation));
+        assert!(model.settings.allowed_actions.has(Action::QuickInnovation));
         assert!(
             !model
                 .settings
@@ -1614,6 +1615,20 @@ mod tests {
         assert!(state.simulation.effects.quick_innovation_available());
         assert_eq!(state.simulation.effects.crafter_delineations(), 2);
         assert!(state.simulation.effects.heart_and_soul_available());
+
+        let mut nonspecialist: serde_json::Value =
+            serde_json::from_slice(&gabriel_request()).unwrap();
+        nonspecialist["specialist"] = serde_json::json!(false);
+        let request: GabrielSolveRequest = serde_json::from_value(nonspecialist).unwrap();
+        let (model, _) = build_gabriel_model(&request).unwrap();
+        assert!(
+            !model
+                .settings
+                .allowed_actions
+                .has(Action::CarefulObservation)
+        );
+        assert!(!model.settings.allowed_actions.has(Action::HeartAndSoul));
+        assert!(!model.settings.allowed_actions.has(Action::QuickInnovation));
     }
 
     #[test]

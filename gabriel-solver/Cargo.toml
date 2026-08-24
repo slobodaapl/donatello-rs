@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 raphael-sim = { workspace = true }
+raphael-solver = { workspace = true }
 rayon = { workspace = true }
 wide = "0.8.2"
 

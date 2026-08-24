@@ -1,4 +1,5 @@
 use raphael_sim::{Action, ActionError, Condition, Settings, SimulationState};
+use raphael_solver::stochastic_policy::{DecisionState, StochasticModel};
 
 pub const CONDITION_COUNT: usize = 11;
 
@@ -11,7 +12,7 @@ pub enum TerminalStatus {
     Horizon,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct State {
     pub simulation: SimulationState,
     pub condition: Condition,
@@ -75,64 +76,22 @@ impl RecipeModel {
         succeeded: bool,
         condition_draw: f64,
     ) -> Result<State, ActionError> {
-        let specialist_action = matches!(
+        let next = self.stochastic_model().apply_outcome(
+            DecisionState {
+                simulation: state.simulation,
+                condition: state.condition,
+                step: state.step,
+                decisions: state.decisions,
+            },
             action,
-            Action::CarefulObservation | Action::HeartAndSoul | Action::QuickInnovation
-        );
-        if specialist_action && state.simulation.effects.crafter_delineations() == 0 {
-            return Err(ActionError::NoRemainingUses);
-        }
-        let mut simulation = if action == Action::CarefulObservation {
-            if state.simulation.effects.careful_observation_charges() == 0 {
-                return Err(ActionError::NoRemainingUses);
-            }
-            state.simulation
-        } else {
-            state.simulation.use_action_with_outcome(
-                action,
-                state.condition,
-                &self.settings,
-                succeeded,
-            )?
-        };
-        let previous_effects = state.simulation.effects;
-        let spent_delineation = succeeded
-            && matches!(
-                action,
-                Action::CarefulObservation | Action::HeartAndSoul | Action::QuickInnovation
-            );
-        simulation.effects = simulation
-            .effects
-            .with_careful_observation_charges(
-                previous_effects
-                    .careful_observation_charges()
-                    .saturating_sub(u8::from(succeeded && action == Action::CarefulObservation)),
-            )
-            .with_crafter_delineations(
-                previous_effects
-                    .crafter_delineations()
-                    .saturating_sub(u8::from(spent_delineation)),
-            )
-            .with_heart_and_soul_available(
-                previous_effects.heart_and_soul_available()
-                    && !(succeeded && action == Action::HeartAndSoul),
-            )
-            .with_quick_innovation_available(
-                previous_effects.quick_innovation_available()
-                    && !(succeeded && action == Action::QuickInnovation),
-            );
-        let condition = if action.advances_condition() {
-            self.next_condition(state.condition, condition_draw)
-        } else {
-            state.condition
-        };
+            succeeded,
+            condition_draw,
+        )?;
         Ok(State {
-            simulation,
-            condition,
-            step: state
-                .step
-                .saturating_add(u8::from(action.increases_step_count())),
-            decisions: state.decisions.saturating_add(1),
+            simulation: next.simulation,
+            condition: next.condition,
+            step: next.step,
+            decisions: next.decisions,
         })
     }
 
@@ -154,39 +113,13 @@ impl RecipeModel {
         self.apply_outcome(state, action, succeeded, condition_draw)
     }
 
-    fn next_condition(&self, current: Condition, draw: f64) -> Condition {
-        match current {
-            Condition::Excellent => Condition::Poor,
-            Condition::Poor => Condition::Normal,
-            Condition::GoodOmen => Condition::Good,
-            Condition::Robust => Condition::Sturdy,
-            _ => {
-                let mut threshold = 0.0;
-                for (index, probability) in self.condition_probabilities_bps.iter().enumerate() {
-                    threshold += f64::from(*probability) / 10_000.0;
-                    if draw < threshold {
-                        return condition_from_index(index);
-                    }
-                }
-                Condition::Normal
-            }
+    pub fn stochastic_model(&self) -> StochasticModel {
+        StochasticModel {
+            settings: self.settings,
+            condition_probabilities_bps: self.condition_probabilities_bps,
+            max_steps: self.max_steps,
+            max_decisions: self.max_decisions,
         }
-    }
-}
-
-fn condition_from_index(index: usize) -> Condition {
-    match index {
-        1 => Condition::Good,
-        2 => Condition::Excellent,
-        3 => Condition::Poor,
-        4 => Condition::Centered,
-        5 => Condition::Sturdy,
-        6 => Condition::Pliant,
-        7 => Condition::Malleable,
-        8 => Condition::Primed,
-        9 => Condition::GoodOmen,
-        10 => Condition::Robust,
-        _ => Condition::Normal,
     }
 }
 

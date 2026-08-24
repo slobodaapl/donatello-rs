@@ -17,6 +17,8 @@ pub use progress_frontier_solver::{
     ProgressEndpoint, ProgressFrontierSolver, ProgressPolicy, ProgressTarget,
 };
 
+pub mod stochastic_policy;
+
 mod utils;
 pub use utils::AtomicFlag;
 

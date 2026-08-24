@@ -1,7 +1,11 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use raphael_sim::{Action, Combo, Condition};
+use raphael_solver::stochastic_policy::{
+    DecisionState as StochasticDecisionState, StochasticPolicySolver,
+};
 use rayon::prelude::*;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
@@ -14,6 +18,13 @@ const POLICY_PILOT_ROLLOUTS: usize = 4;
 const POLICY_SCREEN_ROLLOUTS: usize = 16;
 const POLICY_FINAL_ROLLOUTS: usize = 64;
 const POLICY_FINALISTS: usize = 4;
+const FULL_QUALITY_COMPLETION_UTILITY: f64 = 1_500.0;
+const TREE_SEARCH_SIMULATIONS: usize = 2_048;
+const TREE_SEARCH_DEPTH: usize = 6;
+const TREE_SEARCH_EXPLORATION: f64 = 1.25;
+const TREE_SEARCH_ENABLED: bool = true;
+const BOUNDED_POLICY_IMPROVEMENT_MIN_STEP: u8 = 42;
+const BOUNDED_POLICY_IMPROVEMENT_EXPANSION_LIMIT: usize = 20_000;
 // Checkpoint input scales only. They neither terminate search nor gate a recipe/action.
 const ACTOR_STEP_SCALE: f32 = 55.0;
 const ACTOR_DECISION_SCALE: f32 = 64.0;
@@ -67,6 +78,7 @@ const TRAINED_EYE: usize = 27;
 const HEART_AND_SOUL: usize = 28;
 const PRUDENT_SYNTHESIS: usize = 29;
 const TRAINED_FINESSE: usize = 30;
+#[cfg(test)]
 const QUICK_INNOVATION: usize = 32;
 const DARING_TOUCH: usize = 33;
 const IMMACULATE_MEND: usize = 34;
@@ -139,6 +151,19 @@ struct ActionEvaluation {
     action: usize,
     values: Vec<f64>,
     actor_score: f32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TreeAction {
+    visits: u32,
+    total_value: f64,
+    prior: f32,
+    legal: bool,
+}
+
+struct TreeNode {
+    visits: u32,
+    actions: [TreeAction; ACTION_COUNT],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -314,6 +339,15 @@ fn recommend_with_actor(
         }
         return Err(String::from("Gabriel found no game-legal action"));
     }
+    if late_heart_and_soul_legal(model, state) {
+        return Ok(Recommendation {
+            action: ACTIONS[HEART_AND_SOUL],
+            planned: true,
+            failure_closure: false,
+            candidate_count: 1,
+            rollout_count: 0,
+        });
+    }
     if state.simulation.quality >= model.required_quality {
         let Some(action) = progress_greedy(model, state) else {
             if failure_closure_legal(model, state) {
@@ -337,7 +371,7 @@ fn recommend_with_actor(
             rollout_count: 0,
         });
     }
-    let (action, candidate_count, rollout_count) =
+    let (mut action, candidate_count, mut rollout_count) =
         match policy_improvement_action(model, state, seed, actor) {
             Ok(result) => result,
             Err(_) if failure_closure_legal(model, state) => {
@@ -351,6 +385,48 @@ fn recommend_with_actor(
             }
             Err(error) => return Err(error),
         };
+    if TREE_SEARCH_ENABLED
+        && tree_search_worthwhile(model, state)
+        && let Some((tree_action, _, tree_rollouts)) = tree_search_action(model, state, seed, actor)
+    {
+        rollout_count += tree_rollouts;
+        if tree_action != action {
+            let admission_start = POLICY_FINAL_ROLLOUTS;
+            let admission_end = admission_start + 512;
+            let incumbent = ActionEvaluation {
+                action,
+                values: policy_rollout_values(
+                    model,
+                    state,
+                    action,
+                    seed ^ 0xE703_7ED1_A0B4_28DB,
+                    actor,
+                    admission_start..admission_end,
+                ),
+                actor_score: 0.0,
+            };
+            let challenger = ActionEvaluation {
+                action: tree_action,
+                values: policy_rollout_values(
+                    model,
+                    state,
+                    tree_action,
+                    seed ^ 0xE703_7ED1_A0B4_28DB,
+                    actor,
+                    admission_start..admission_end,
+                ),
+                actor_score: 0.0,
+            };
+            rollout_count += 1_024;
+            if paired_improvement(&challenger, &incumbent) {
+                action = tree_action;
+            }
+        }
+    }
+    action = preserve_active_innovation(model, state, action, actor);
+    action = bounded_policy_improvement_action(model, state, action, actor);
+    action = urgent_pliant_durability_recovery(model, state, action);
+    action = late_mend_efficiency_override(model, state, action);
     Ok(Recommendation {
         action: ACTIONS[action],
         planned: true,
@@ -358,6 +434,327 @@ fn recommend_with_actor(
         candidate_count,
         rollout_count,
     })
+}
+
+fn urgent_pliant_durability_recovery(model: &RecipeModel, state: State, incumbent: usize) -> usize {
+    if state.condition == Condition::Pliant
+        && state.simulation.quality < model.required_quality
+        && state.simulation.durability < model.settings.max_durability / 3
+        && planner_legal(model, state, IMMACULATE_MEND)
+    {
+        IMMACULATE_MEND
+    } else {
+        incumbent
+    }
+}
+
+fn late_mend_efficiency_override(model: &RecipeModel, state: State, incumbent: usize) -> usize {
+    if incumbent != IMMACULATE_MEND
+        || state.condition == Condition::Pliant
+        || state.simulation.effects.great_strides() > 0
+        || state.simulation.effects.innovation() > 0
+        || model.max_steps.saturating_sub(state.step) > 12
+        || !planner_legal(model, state, MASTERS_MEND)
+    {
+        return incumbent;
+    }
+    let Ok(next) = model.apply_outcome(state, ACTIONS[MASTERS_MEND], true, 0.0) else {
+        return incumbent;
+    };
+    if next.simulation.durability >= model.settings.max_durability.div_ceil(2) {
+        MASTERS_MEND
+    } else {
+        incumbent
+    }
+}
+
+fn bounded_policy_improvement_action(
+    model: &RecipeModel,
+    state: State,
+    incumbent: usize,
+    actor: &ActorModel,
+) -> usize {
+    if state.step < BOUNDED_POLICY_IMPROVEMENT_MIN_STEP {
+        return incumbent;
+    }
+    if let Some(action) = direct_quality_then_progress_closure(model, state) {
+        return action;
+    }
+    if !matches!(
+            state.condition,
+            Condition::Good
+                | Condition::Excellent
+                | Condition::Sturdy
+                | Condition::Pliant
+                | Condition::Malleable
+                | Condition::Primed
+                | Condition::Robust
+        ) {
+        return incumbent;
+    }
+    let root = stochastic_decision_state(state);
+    let mut solver = match StochasticPolicySolver::new(
+        model.stochastic_model(),
+        model.required_quality,
+        ACTIONS,
+        BOUNDED_POLICY_IMPROVEMENT_EXPANSION_LIMIT,
+    ) {
+        Ok(solver) => solver,
+        Err(_) => return incumbent,
+    };
+    let outcome = match solver.improve_policy_full_quality_best_first_bounded(root, &|decision| {
+        if decision == root {
+            return Some(ACTIONS[incumbent]);
+        }
+        bounded_continuation_action(model, gabriel_state(decision), actor)
+            .map(|action| ACTIONS[action])
+    }) {
+        Ok(outcome) => outcome,
+        _ => return incumbent,
+    };
+    if !outcome.improvement_proven {
+        return incumbent;
+    }
+    ACTIONS
+        .iter()
+        .position(|action| *action == outcome.action)
+        .unwrap_or(incumbent)
+}
+
+fn direct_quality_then_progress_closure(model: &RecipeModel, state: State) -> Option<usize> {
+    ACTIONS.iter().enumerate().find_map(|(action, candidate)| {
+        if candidate.success_rate(&state.simulation, state.condition) < 100
+            || quality_gain(model, state, action) == 0
+            || !planner_legal(model, state, action)
+        {
+            return None;
+        }
+        let Ok(next) = model.apply_outcome(state, *candidate, true, 0.0) else {
+            return None;
+        };
+        if next.simulation.quality < model.required_quality {
+            return None;
+        }
+        if next.simulation.progress >= model.settings.max_progress {
+            return Some(action);
+        }
+        let conservative_next = State {
+            condition: Condition::Normal,
+            ..next
+        };
+        (planner_legal(model, conservative_next, BASIC_SYNTHESIS)
+            && model
+                .settings
+                .max_progress
+                .saturating_sub(conservative_next.simulation.progress)
+                <= unbuffed_basic_synthesis_gain(model, conservative_next))
+        .then_some(action)
+    })
+}
+
+fn bounded_continuation_action(
+    model: &RecipeModel,
+    state: State,
+    actor: &ActorModel,
+) -> Option<usize> {
+    if state.simulation.quality >= model.required_quality {
+        progress_greedy(model, state)
+    } else {
+        condition_aware_actor_action(model, state, actor)
+    }
+    .or_else(|| failure_closure_legal(model, state).then_some(BASIC_SYNTHESIS))
+}
+
+fn stochastic_decision_state(state: State) -> StochasticDecisionState {
+    StochasticDecisionState {
+        simulation: state.simulation,
+        condition: state.condition,
+        step: state.step,
+        decisions: state.decisions,
+    }
+}
+
+fn gabriel_state(state: StochasticDecisionState) -> State {
+    State {
+        simulation: state.simulation,
+        condition: state.condition,
+        step: state.step,
+        decisions: state.decisions,
+    }
+}
+
+fn preserve_active_innovation(
+    model: &RecipeModel,
+    state: State,
+    action: usize,
+    actor: &ActorModel,
+) -> usize {
+    if state.simulation.effects.innovation() != 1
+        || state.simulation.quality >= model.required_quality
+        || state.condition == Condition::Malleable
+        || !is_progress(action)
+        || action == DELICATE_SYNTHESIS
+    {
+        return action;
+    }
+    let (candidates, actor_scores) = candidate_actions(model, state, actor);
+    candidates
+        .into_iter()
+        .filter(|candidate| !is_progress(*candidate) && quality_gain(model, state, *candidate) > 0)
+        .max_by(|left, right| {
+            let expected_gain = |candidate: usize| {
+                u32::from(quality_gain(model, state, candidate))
+                    * u32::from(ACTIONS[candidate].success_rate(&state.simulation, state.condition))
+            };
+            expected_gain(*left)
+                .cmp(&expected_gain(*right))
+                .then_with(|| actor_scores[*left].total_cmp(&actor_scores[*right]))
+                .then_with(|| right.cmp(left))
+        })
+        .unwrap_or(action)
+}
+
+fn tree_search_worthwhile(_model: &RecipeModel, state: State) -> bool {
+    state.step >= 15
+}
+
+fn late_heart_and_soul_legal(model: &RecipeModel, state: State) -> bool {
+    let effects = state.simulation.effects;
+    state.condition == Condition::Normal
+        && state.step >= 38
+        && effects.careful_observation_charges() == 0
+        && !effects.quick_innovation_available()
+        && effects.heart_and_soul_available()
+        && effects.crafter_delineations() > 0
+        && planner_legal(model, state, HEART_AND_SOUL)
+}
+
+fn tree_search_action(
+    model: &RecipeModel,
+    root: State,
+    seed: u64,
+    actor: &ActorModel,
+) -> Option<(usize, usize, usize)> {
+    let root_node = TreeNode::new(model, root, actor);
+    let candidate_count = root_node
+        .actions
+        .iter()
+        .filter(|action| action.legal)
+        .count();
+    if candidate_count == 0 {
+        return None;
+    }
+    let mut tree = HashMap::new();
+    tree.insert(root, root_node);
+    let mut path = Vec::with_capacity(TREE_SEARCH_DEPTH);
+
+    for simulation in 0..TREE_SEARCH_SIMULATIONS {
+        path.clear();
+        let mut state = root;
+        let mut stream =
+            CounterStream::new(derive_seed(seed ^ 0xD1B5_4A32_D192_ED03, simulation as u64));
+        let mut reward = None;
+
+        for _ in 0..TREE_SEARCH_DEPTH {
+            if model.status(state) != TerminalStatus::Active {
+                reward = Some(terminal_utility(model, state) / FULL_QUALITY_COMPLETION_UTILITY);
+                break;
+            }
+            if !tree.contains_key(&state) {
+                tree.insert(state, TreeNode::new(model, state, actor));
+                reward = Some(
+                    continuation_utility(model, state, &mut stream, actor)
+                        / FULL_QUALITY_COMPLETION_UTILITY,
+                );
+                break;
+            }
+            let action = tree.get(&state)?.select_action()?;
+            path.push((state, action));
+            match model.apply_counter(state, ACTIONS[action], &mut stream) {
+                Ok(next) => state = next,
+                Err(_) => {
+                    reward = Some(-1.0);
+                    break;
+                }
+            }
+        }
+        let reward = reward.unwrap_or_else(|| {
+            continuation_utility(model, state, &mut stream, actor) / FULL_QUALITY_COMPLETION_UTILITY
+        });
+        for (state, action) in path.iter().copied() {
+            let node = tree.get_mut(&state)?;
+            node.visits = node.visits.saturating_add(1);
+            let action = &mut node.actions[action];
+            action.visits = action.visits.saturating_add(1);
+            action.total_value += reward;
+        }
+    }
+
+    let root_node = tree.get(&root)?;
+    let action = (0..ACTION_COUNT)
+        .filter(|action| root_node.actions[*action].legal)
+        .max_by(|left, right| {
+            let left_action = root_node.actions[*left];
+            let right_action = root_node.actions[*right];
+            tree_action_mean(left_action)
+                .total_cmp(&tree_action_mean(right_action))
+                .then_with(|| left_action.visits.cmp(&right_action.visits))
+                .then_with(|| left_action.prior.total_cmp(&right_action.prior))
+                .then_with(|| right.cmp(left))
+        })?;
+    Some((action, candidate_count, TREE_SEARCH_SIMULATIONS))
+}
+
+impl TreeNode {
+    fn new(model: &RecipeModel, state: State, actor: &ActorModel) -> Self {
+        let (candidates, actor_scores) = candidate_actions(model, state, actor);
+        let mut actions = [TreeAction::default(); ACTION_COUNT];
+        for action in candidates {
+            actions[action] = TreeAction {
+                prior: actor_scores[action],
+                legal: true,
+                ..TreeAction::default()
+            };
+        }
+        Self { visits: 0, actions }
+    }
+
+    fn select_action(&self) -> Option<usize> {
+        let unvisited = (0..ACTION_COUNT)
+            .filter(|action| self.actions[*action].legal && self.actions[*action].visits == 0)
+            .max_by(|left, right| {
+                self.actions[*left]
+                    .prior
+                    .total_cmp(&self.actions[*right].prior)
+                    .then_with(|| right.cmp(left))
+            });
+        if unvisited.is_some() {
+            return unvisited;
+        }
+        let exploration_scale = f64::from(self.visits.max(1)).ln().sqrt();
+        (0..ACTION_COUNT)
+            .filter(|action| self.actions[*action].legal)
+            .max_by(|left, right| {
+                let score = |action: usize| {
+                    let action = self.actions[action];
+                    tree_action_mean(action)
+                        + TREE_SEARCH_EXPLORATION * exploration_scale
+                            / f64::from(action.visits).sqrt()
+                };
+                score(*left)
+                    .total_cmp(&score(*right))
+                    .then_with(|| {
+                        self.actions[*left]
+                            .prior
+                            .total_cmp(&self.actions[*right].prior)
+                    })
+                    .then_with(|| right.cmp(left))
+            })
+    }
+}
+
+fn tree_action_mean(action: TreeAction) -> f64 {
+    action.total_value / f64::from(action.visits.max(1))
 }
 
 fn failure_closure_legal(model: &RecipeModel, state: State) -> bool {
@@ -506,7 +903,10 @@ fn select_finalist_actions(
 }
 
 fn completion_count(values: &[f64]) -> usize {
-    values.iter().filter(|value| **value >= 1_000.0).count()
+    values
+        .iter()
+        .filter(|value| **value >= FULL_QUALITY_COMPLETION_UTILITY)
+        .count()
 }
 
 fn best_action(evaluations: &[ActionEvaluation]) -> Option<usize> {
@@ -542,8 +942,8 @@ fn paired_improvement(challenger: &ActionEvaluation, incumbent: &ActionEvaluatio
         .iter()
         .zip(&incumbent.values)
         .map(|(candidate, baseline)| {
-            let candidate_success = *candidate >= 1_000.0;
-            let baseline_success = *baseline >= 1_000.0;
+            let candidate_success = *candidate >= FULL_QUALITY_COMPLETION_UTILITY;
+            let baseline_success = *baseline >= FULL_QUALITY_COMPLETION_UTILITY;
             gains += usize::from(candidate_success && !baseline_success);
             losses += usize::from(!candidate_success && baseline_success);
             candidate - baseline
@@ -577,16 +977,25 @@ fn rollout_utility(
         return -1_000.0;
     };
     state = next;
+    continuation_utility(model, state, &mut stream, actor)
+}
+
+fn continuation_utility(
+    model: &RecipeModel,
+    mut state: State,
+    stream: &mut CounterStream,
+    actor: &ActorModel,
+) -> f64 {
     while model.status(state) == TerminalStatus::Active {
         let action = if state.simulation.quality >= model.required_quality {
             progress_greedy(model, state)
         } else {
-            shielded_actor_action_finish(model, state, actor)
+            condition_aware_actor_action(model, state, actor)
         };
         let Some(action) = action else {
             break;
         };
-        let Ok(next) = model.apply_counter(state, ACTIONS[action], &mut stream) else {
+        let Ok(next) = model.apply_counter(state, ACTIONS[action], stream) else {
             break;
         };
         state = next;
@@ -594,13 +1003,23 @@ fn rollout_utility(
     terminal_utility(model, state)
 }
 
+fn condition_aware_actor_action(
+    model: &RecipeModel,
+    state: State,
+    actor: &ActorModel,
+) -> Option<usize> {
+    let incumbent = shielded_actor_action_finish(model, state, actor)?;
+    let (candidates, actor_scores) = candidate_actions(model, state, actor);
+    condition_prior_action(model, state, &candidates, &actor_scores).or(Some(incumbent))
+}
+
 fn terminal_utility(model: &RecipeModel, state: State) -> f64 {
     let quality =
         (f64::from(state.simulation.quality) / f64::from(model.required_quality)).min(1.0);
     let progress =
         (f64::from(state.simulation.progress) / f64::from(model.settings.max_progress)).min(1.0);
-    let success = f64::from(model.status(state) == TerminalStatus::Complete);
-    1_000.0 * success + 30.0 * quality.min(progress).powi(10) + 10.0 * (quality * progress).powi(5)
+    let completion = f64::from(model.status(state) == TerminalStatus::Complete);
+    100.0 * completion + 1_000.0 * quality.powi(4) + 400.0 * (quality * progress).powi(5)
 }
 
 fn progress_greedy(model: &RecipeModel, state: State) -> Option<usize> {
@@ -633,11 +1052,6 @@ fn progress_greedy(model: &RecipeModel, state: State) -> Option<usize> {
         if legal_with_durability(model, state, CAREFUL_SYNTHESIS) {
             return Some(CAREFUL_SYNTHESIS);
         }
-    }
-    if state.condition == Condition::Centered
-        && legal_with_durability(model, state, RAPID_SYNTHESIS)
-    {
-        return Some(RAPID_SYNTHESIS);
     }
     if state.condition == Condition::Pliant {
         if state.simulation.durability <= 20 && planner_legal(model, state, IMMACULATE_MEND) {
@@ -1195,19 +1609,30 @@ fn planner_legal(model: &RecipeModel, state: State, action: usize) -> bool {
 fn compute_planner_legal(model: &RecipeModel, state: State, action: usize) -> bool {
     // The actor checkpoint retains its original 36 output slots, but Gabriel must never
     // search or emit actions forbidden by its policy.
-    if matches!(
-        action,
-        FINAL_APPRAISAL | TRAINED_EYE | CAREFUL_OBSERVATION | QUICK_INNOVATION
-    ) || model.status(state) != TerminalStatus::Active
+    if matches!(action, FINAL_APPRAISAL | TRAINED_EYE)
+        || model.status(state) != TerminalStatus::Active
     {
         return false;
     }
     if !required_action_sequence_legal(model, state, action) {
         return false;
     }
+    if action == CAREFUL_OBSERVATION
+        && state.simulation.effects.careful_observation_charges() == 1
+        && state.simulation.effects.inner_quiet() < 10
+    {
+        return false;
+    }
     let Ok(next) = model.apply_outcome(state, ACTIONS[action], true, 0.0) else {
         return false;
     };
+    if action == HEART_AND_SOUL
+        && ![INTENSIVE_SYNTHESIS, PRECISE_TOUCH]
+            .into_iter()
+            .any(|followup| compute_planner_legal(model, next, followup))
+    {
+        return false;
+    }
     if next.simulation.progress >= model.settings.max_progress
         && next.simulation.quality < model.required_quality
     {
@@ -1415,7 +1840,7 @@ fn features(model: &RecipeModel, state: State) -> [f32; FEATURE_COUNT] {
     values[17] = f32::from(effects.heart_and_soul_available());
     values[18] = f32::from(effects.quick_innovation_available());
     values[19] = f32::from(effects.careful_observation_charges()) / 3.0;
-    values[20] = f32::from(effects.crafter_delineations()) / 2.0;
+    values[20] = f32::from(effects.crafter_delineations().min(2)) / 2.0;
     values[21] = f32::from(effects.combo() == Combo::BasicTouch);
     values[22] = f32::from(effects.combo() == Combo::StandardTouch);
     values[23] = f32::from(effects.expedience());
@@ -1600,7 +2025,101 @@ mod tests {
     }
 
     #[test]
-    fn forbidden_actions_are_not_gabriel_actions() {
+    fn urgent_pliant_recovery_uses_the_discounted_full_mend() {
+        let (model, mut state) = fixture();
+        state.step = 1;
+        state.decisions = 1;
+        state.condition = Condition::Pliant;
+        state.simulation.durability = model.settings.max_durability / 3 - 1;
+        state.simulation.effects = state.simulation.effects.with_combo(Combo::None);
+
+        assert_eq!(
+            urgent_pliant_durability_recovery(&model, state, MANIPULATION),
+            IMMACULATE_MEND
+        );
+
+        state.condition = Condition::Normal;
+        assert_eq!(
+            urgent_pliant_durability_recovery(&model, state, MANIPULATION),
+            MANIPULATION
+        );
+    }
+
+    #[test]
+    fn late_non_pliant_master_mend_does_not_consume_active_quality_buffs() {
+        let (model, mut state) = fixture();
+        state.step = model.max_steps - 12;
+        state.decisions = state.step;
+        state.condition = Condition::Centered;
+        state.simulation.durability = 10;
+        state.simulation.effects = state.simulation.effects.with_combo(Combo::None);
+
+        assert_eq!(
+            late_mend_efficiency_override(&model, state, IMMACULATE_MEND),
+            MASTERS_MEND
+        );
+
+        state.simulation.effects = state.simulation.effects.with_great_strides(2);
+        assert_eq!(
+            late_mend_efficiency_override(&model, state, IMMACULATE_MEND),
+            IMMACULATE_MEND
+        );
+
+        state.simulation.effects = state
+            .simulation
+            .effects
+            .with_great_strides(0)
+            .with_innovation(4);
+        assert_eq!(
+            late_mend_efficiency_override(&model, state, IMMACULATE_MEND),
+            IMMACULATE_MEND
+        );
+    }
+
+    #[test]
+    fn deterministic_two_action_closure_avoids_exact_search_without_hiding_cp_recovery() {
+        let (model, mut state) = fixture();
+        state.step = 47;
+        state.decisions = 47;
+        state.condition = Condition::Pliant;
+        state.simulation.progress = 11_012;
+        state.simulation.quality = 0;
+        state.simulation.durability = 25;
+        state.simulation.cp = 106;
+        state.simulation.effects = state
+            .simulation
+            .effects
+            .with_inner_quiet(2)
+            .with_innovation(3)
+            .with_waste_not(2)
+            .with_combo(Combo::None);
+
+        let preparatory = ACTIONS
+            .iter()
+            .position(|action| *action == Action::PreparatoryTouch)
+            .unwrap();
+        let preparatory_gain = quality_gain(&model, state, preparatory);
+        state.simulation.quality = model.required_quality - preparatory_gain;
+
+        assert_eq!(
+            direct_quality_then_progress_closure(&model, state).map(|action| ACTIONS[action]),
+            Some(Action::PreparatoryTouch)
+        );
+
+        state.condition = Condition::Good;
+        state.simulation.quality = 30_941;
+        state.simulation.durability = 12;
+        state.simulation.cp = 8;
+        state.simulation.effects = state
+            .simulation
+            .effects
+            .with_innovation(0)
+            .with_waste_not(0);
+        assert_eq!(direct_quality_then_progress_closure(&model, state), None);
+    }
+
+    #[test]
+    fn specialist_actions_join_gabriel_candidates_after_the_opener() {
         let (model, mut state) = fixture();
         state.simulation.effects = state
             .simulation
@@ -1608,6 +2127,9 @@ mod tests {
             .with_careful_observation_charges(3)
             .with_crafter_delineations(2)
             .with_quick_innovation_available(true);
+        state.simulation.effects = state.simulation.effects.with_combo(Combo::None);
+        state.step = 1;
+        state.decisions = 1;
         assert!(
             model
                 .settings
@@ -1617,15 +2139,35 @@ mod tests {
         assert!(model.settings.allowed_actions.has(Action::QuickInnovation));
         assert!(model.settings.allowed_actions.has(Action::FinalAppraisal));
         assert!(!planner_legal(&model, state, FINAL_APPRAISAL));
-        assert!(!planner_legal(&model, state, CAREFUL_OBSERVATION));
-        assert!(!planner_legal(&model, state, QUICK_INNOVATION));
+        assert!(planner_legal(&model, state, CAREFUL_OBSERVATION));
+        assert!(planner_legal(&model, state, QUICK_INNOVATION));
+        state.condition = Condition::Good;
+        assert!(planner_legal(&model, state, CAREFUL_OBSERVATION));
+        assert!(planner_legal(&model, state, QUICK_INNOVATION));
+        state.condition = Condition::Normal;
         assert!(!ACTIONS.contains(&Action::StellarSteadyHand));
 
         let actor = ActorModel::bundled().unwrap();
         let (candidates, _) = candidate_actions(&model, state, actor);
         assert!(!candidates.contains(&FINAL_APPRAISAL));
-        assert!(!candidates.contains(&CAREFUL_OBSERVATION));
-        assert!(!candidates.contains(&QUICK_INNOVATION));
+        assert!(candidates.contains(&CAREFUL_OBSERVATION));
+        assert!(candidates.contains(&QUICK_INNOVATION));
+    }
+
+    #[test]
+    fn final_careful_observation_charge_waits_for_inner_quiet_ten() {
+        let (model, mut state) = fixture();
+        state.simulation.effects = state
+            .simulation
+            .effects
+            .with_combo(Combo::None)
+            .with_careful_observation_charges(1);
+        state.step = 1;
+        state.decisions = 1;
+        assert!(!planner_legal(&model, state, CAREFUL_OBSERVATION));
+
+        state.simulation.effects = state.simulation.effects.with_inner_quiet(10);
+        assert!(planner_legal(&model, state, CAREFUL_OBSERVATION));
     }
 
     #[test]
@@ -1649,6 +2191,18 @@ mod tests {
             terminal_utility(&first_model, first_state),
             terminal_utility(&second_model, second_state)
         );
+    }
+
+    #[test]
+    fn dense_terminal_value_prioritizes_quality_before_progress_closure() {
+        let (model, mut quality_first) = fixture();
+        quality_first.simulation.quality = model.required_quality;
+        quality_first.simulation.progress = model.settings.max_progress / 5 * 4;
+        let mut progress_first = quality_first;
+        progress_first.simulation.quality = model.required_quality / 5 * 4;
+        progress_first.simulation.progress = model.settings.max_progress;
+
+        assert!(terminal_utility(&model, quality_first) > terminal_utility(&model, progress_first));
     }
 
     #[test]
@@ -1705,13 +2259,20 @@ mod tests {
             actor_score: 0.0,
         };
         assert!(paired_improvement(
-            &evaluation(vec![1_000.0, 10.0, 10.0]),
+            &evaluation(vec![FULL_QUALITY_COMPLETION_UTILITY, 10.0, 10.0]),
             &evaluation(vec![0.0, 0.0, 0.0])
         ));
         assert!(!paired_improvement(
             &evaluation(vec![0.0, 0.0, 0.0]),
-            &evaluation(vec![1_000.0, 10.0, 10.0])
+            &evaluation(vec![FULL_QUALITY_COMPLETION_UTILITY, 10.0, 10.0])
         ));
+        assert_eq!(
+            completion_count(&[
+                FULL_QUALITY_COMPLETION_UTILITY - 0.001,
+                FULL_QUALITY_COMPLETION_UTILITY,
+            ]),
+            1
+        );
         assert!(paired_improvement(
             &evaluation(vec![10.0; 8]),
             &evaluation(vec![0.0; 8])
