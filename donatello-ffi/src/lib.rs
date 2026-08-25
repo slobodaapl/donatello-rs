@@ -1,23 +1,25 @@
 use std::cmp::Reverse;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{CString, c_char};
 use std::mem::size_of;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::slice;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use raphael_sim::{
     Action, ActionMask, Combo, Condition, Effects, Settings, SimulationState, SpecialQualityState,
 };
 use raphael_solver::{
-    AtomicFlag, MacroSolver, ProgressFrontierSolver, ProgressPolicy, ProgressTarget, SolverSettings,
+    AtomicFlag, MacroSolver, ProgressFrontierSolver, ProgressPolicy, ProgressTarget,
+    SolveProgressSignal, SolverSettings,
 };
 use serde::{Deserialize, Serialize};
 
 const ABI_VERSION: u32 = 13;
 const DEFAULT_CACHE_BUDGET: usize = 512 * 1024 * 1024;
 const DEFAULT_GABRIEL_WORKER_THREADS: usize = 4;
+const GABRIEL_PLANNER_CACHE_CAPACITY: usize = 16;
 
 type CachedSolver = Arc<Mutex<MacroSolver<'static>>>;
 static SOLVER_CACHE: OnceLock<Mutex<SolverCache>> = OnceLock::new();
@@ -25,6 +27,8 @@ type SolutionCacheKey = (SolverSettings, SimulationState, Condition, bool, u8, b
 static SOLUTION_CACHE: OnceLock<Mutex<SolutionCache>> = OnceLock::new();
 static CACHE_BUDGET: AtomicUsize = AtomicUsize::new(DEFAULT_CACHE_BUDGET);
 static SOLVER_WORKERS: OnceLock<usize> = OnceLock::new();
+type CachedGabrielPlanner = Arc<Mutex<gabriel_solver::GabrielPlanner>>;
+static GABRIEL_PLANNER_CACHE: OnceLock<Mutex<GabrielPlannerCache>> = OnceLock::new();
 
 #[derive(Default)]
 struct SolutionCache {
@@ -36,6 +40,11 @@ struct SolutionCache {
 struct SolverCache {
     entries: VecDeque<(SolverSettings, CachedSolver, usize)>,
     retained_bytes: usize,
+}
+
+#[derive(Default)]
+struct GabrielPlannerCache {
+    entries: VecDeque<(u64, CachedGabrielPlanner)>,
 }
 
 #[derive(Deserialize)]
@@ -133,6 +142,8 @@ struct GabrielSolveRequest {
     #[serde(default)]
     samples: usize,
     seed: u64,
+    #[serde(default)]
+    session_id: Option<u64>,
     root: GabrielRootState,
 }
 
@@ -401,12 +412,26 @@ fn solve_gabriel(request: GabrielSolveRequest) -> GabrielSolveResponse {
         let (model, state) = build_gabriel_model(&request)?;
         match request.operation {
             0 => {
-                let recommendation = gabriel_solver::recommend_with_worker_threads(
-                    &model,
-                    state,
-                    request.seed,
-                    request.worker_threads,
-                )?;
+                let recommendation = if let Some(session_id) = request.session_id {
+                    let planner = cached_gabriel_planner(session_id);
+                    let mut planner = planner
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    gabriel_solver::recommend_with_worker_threads_and_planner(
+                        &model,
+                        state,
+                        request.seed,
+                        request.worker_threads,
+                        &mut planner,
+                    )?
+                } else {
+                    gabriel_solver::recommend_with_worker_threads(
+                        &model,
+                        state,
+                        request.seed,
+                        request.worker_threads,
+                    )?
+                };
                 Ok(GabrielSolveResponse {
                     ok: true,
                     action_id: Some(recommendation.action.action_id()),
@@ -465,6 +490,29 @@ fn solve_gabriel(request: GabrielSolveRequest) -> GabrielSolveResponse {
         elapsed_millis: started.elapsed().as_millis(),
         error: Some(error),
     })
+}
+
+fn cached_gabriel_planner(session_id: u64) -> CachedGabrielPlanner {
+    let mut cache = GABRIEL_PLANNER_CACHE
+        .get_or_init(|| Mutex::new(GabrielPlannerCache::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(index) = cache
+        .entries
+        .iter()
+        .position(|(cached_session_id, _)| *cached_session_id == session_id)
+    {
+        let entry = cache.entries.remove(index).unwrap();
+        let planner = Arc::clone(&entry.1);
+        cache.entries.push_back(entry);
+        return planner;
+    }
+    let planner = Arc::new(Mutex::new(gabriel_solver::GabrielPlanner::default()));
+    cache.entries.push_back((session_id, Arc::clone(&planner)));
+    if cache.entries.len() > GABRIEL_PLANNER_CACHE_CAPACITY {
+        cache.entries.pop_front();
+    }
+    planner
 }
 
 fn gabriel_json(data: &[u8]) -> String {
@@ -627,7 +675,7 @@ fn solve(mut request: CraftSolveRequest, interrupt: AtomicFlag) -> Result<SolveR
     improved_solution.store(false, Ordering::Release);
     complete_solution.store(false, Ordering::Release);
     let deadline_reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (deadline_done, deadline_worker) = start_deadline_worker(
+    let deadline_registration = register_deadline(
         interrupt.clone(),
         improved_solution,
         complete_solution,
@@ -676,10 +724,7 @@ fn solve(mut request: CraftSolveRequest, interrupt: AtomicFlag) -> Result<SolveR
             })
             .map_err(|error| format!("{error:?}")),
     };
-    drop(deadline_done);
-    if let Some(worker) = deadline_worker {
-        let _ = worker.join();
-    }
+    drop(deadline_registration);
     let retained_bytes = solver.estimated_retained_bytes();
     drop(solver);
     update_solver_weight(&cached_solver, retained_bytes);
@@ -1011,48 +1056,247 @@ impl DeadlineTracker {
         let hard_expired = hard_millis != 0 && elapsed_millis >= hard_millis;
         hard_expired || (soft_expired && complete_solution)
     }
+
+    fn next_wake_millis(
+        &self,
+        elapsed_millis: u64,
+        complete_solution: bool,
+        soft_millis: u64,
+        hard_millis: u64,
+        reset_soft_deadline_on_improvement: bool,
+    ) -> Option<u64> {
+        let hard_remaining =
+            (hard_millis != 0).then(|| hard_millis.saturating_sub(elapsed_millis).max(1));
+        let soft_remaining = (soft_millis != 0 && complete_solution).then(|| {
+            let soft_expires = if reset_soft_deadline_on_improvement {
+                self.quiet_started_millis.saturating_add(soft_millis)
+            } else {
+                soft_millis
+            };
+            soft_expires.saturating_sub(elapsed_millis).max(1)
+        });
+        hard_remaining.into_iter().chain(soft_remaining).min()
+    }
 }
 
-fn start_deadline_worker(
+struct DeadlineEntry {
     interrupt: AtomicFlag,
-    improved_solution: Arc<std::sync::atomic::AtomicBool>,
-    complete_solution: Arc<std::sync::atomic::AtomicBool>,
+    improved_solution: Arc<SolveProgressSignal>,
+    complete_solution: Arc<SolveProgressSignal>,
+    deadline_reached: Arc<std::sync::atomic::AtomicBool>,
+    started: std::time::Instant,
+    tracker: DeadlineTracker,
+    configuration: DeadlineConfiguration,
+}
+
+#[derive(Clone, Copy)]
+struct DeadlineConfiguration {
+    soft_millis: u64,
+    hard_millis: u64,
+    reset_soft_deadline_on_improvement: bool,
+}
+
+#[derive(Default)]
+struct DeadlineSchedulerState {
+    next_id: u64,
+    entries: HashMap<u64, DeadlineEntry>,
+}
+
+struct DeadlineSchedulerShared {
+    state: Mutex<DeadlineSchedulerState>,
+    wake: Condvar,
+}
+
+struct DeadlineScheduler {
+    shared: Arc<DeadlineSchedulerShared>,
+}
+
+impl DeadlineScheduler {
+    fn new() -> Self {
+        let shared = Arc::new(DeadlineSchedulerShared {
+            state: Mutex::new(DeadlineSchedulerState::default()),
+            wake: Condvar::new(),
+        });
+        let worker_shared = Arc::clone(&shared);
+        std::thread::Builder::new()
+            .name("donatello-deadlines".into())
+            .spawn(move || run_deadline_scheduler(&worker_shared))
+            .expect("deadline scheduler thread must start");
+        #[cfg(test)]
+        DEADLINE_SCHEDULER_STARTS.fetch_add(1, Ordering::Relaxed);
+        Self { shared }
+    }
+
+    fn register(
+        &self,
+        interrupt: AtomicFlag,
+        improved_solution: Arc<SolveProgressSignal>,
+        complete_solution: Arc<SolveProgressSignal>,
+        deadline_reached: Arc<std::sync::atomic::AtomicBool>,
+        configuration: DeadlineConfiguration,
+    ) -> DeadlineRegistration {
+        let id = {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.next_id = state.next_id.wrapping_add(1);
+            let id = state.next_id;
+            state.entries.insert(
+                id,
+                DeadlineEntry {
+                    interrupt,
+                    improved_solution: Arc::clone(&improved_solution),
+                    complete_solution: Arc::clone(&complete_solution),
+                    deadline_reached,
+                    started: std::time::Instant::now(),
+                    tracker: DeadlineTracker::default(),
+                    configuration,
+                },
+            );
+            id
+        };
+        let weak_shared = Arc::downgrade(&self.shared);
+        let notifier: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if let Some(shared) = weak_shared.upgrade() {
+                shared.wake.notify_one();
+            }
+        });
+        improved_solution.set_notifier(Some(Arc::clone(&notifier)));
+        complete_solution.set_notifier(Some(notifier));
+        self.shared.wake.notify_one();
+        DeadlineRegistration {
+            id,
+            shared: Arc::clone(&self.shared),
+            improved_solution,
+            complete_solution,
+        }
+    }
+}
+
+struct DeadlineRegistration {
+    id: u64,
+    shared: Arc<DeadlineSchedulerShared>,
+    improved_solution: Arc<SolveProgressSignal>,
+    complete_solution: Arc<SolveProgressSignal>,
+}
+
+impl Drop for DeadlineRegistration {
+    fn drop(&mut self) {
+        self.improved_solution.set_notifier(None);
+        self.complete_solution.set_notifier(None);
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .remove(&self.id);
+        self.shared.wake.notify_one();
+    }
+}
+
+static DEADLINE_SCHEDULER: OnceLock<DeadlineScheduler> = OnceLock::new();
+#[cfg(test)]
+static DEADLINE_SCHEDULER_STARTS: AtomicUsize = AtomicUsize::new(0);
+
+fn register_deadline(
+    interrupt: AtomicFlag,
+    improved_solution: Arc<SolveProgressSignal>,
+    complete_solution: Arc<SolveProgressSignal>,
     deadline_reached: Arc<std::sync::atomic::AtomicBool>,
     soft_millis: u64,
     hard_millis: u64,
     reset_soft_deadline_on_improvement: bool,
-) -> (
-    std::sync::mpsc::Sender<()>,
-    Option<std::thread::JoinHandle<()>>,
-) {
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
+) -> Option<DeadlineRegistration> {
     if soft_millis == 0 && hard_millis == 0 {
-        return (done_tx, None);
+        return None;
     }
-    let worker = std::thread::spawn(move || {
-        let started = std::time::Instant::now();
-        let mut tracker = DeadlineTracker::default();
-        loop {
-            match done_rx.recv_timeout(std::time::Duration::from_millis(5)) {
-                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            }
-            let elapsed = started.elapsed().as_millis() as u64;
-            if tracker.should_interrupt(
-                elapsed,
-                improved_solution.swap(false, std::sync::atomic::Ordering::AcqRel),
-                complete_solution.load(std::sync::atomic::Ordering::Acquire),
-                soft_millis,
-                hard_millis,
-                reset_soft_deadline_on_improvement,
+    Some(
+        DEADLINE_SCHEDULER
+            .get_or_init(DeadlineScheduler::new)
+            .register(
+                interrupt,
+                improved_solution,
+                complete_solution,
+                deadline_reached,
+                DeadlineConfiguration {
+                    soft_millis,
+                    hard_millis,
+                    reset_soft_deadline_on_improvement,
+                },
+            ),
+    )
+}
+
+fn run_deadline_scheduler(shared: &DeadlineSchedulerShared) {
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        if state.entries.is_empty() {
+            state = shared
+                .wake
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            continue;
+        }
+
+        let mut expired = Vec::new();
+        let mut next_wake_millis = None;
+        for (&id, entry) in &mut state.entries {
+            let elapsed_millis = entry.started.elapsed().as_millis() as u64;
+            let improved_solution = entry
+                .improved_solution
+                .swap(false, std::sync::atomic::Ordering::AcqRel);
+            let complete_solution = entry
+                .complete_solution
+                .load(std::sync::atomic::Ordering::Acquire);
+            if entry.tracker.should_interrupt(
+                elapsed_millis,
+                improved_solution,
+                complete_solution,
+                entry.configuration.soft_millis,
+                entry.configuration.hard_millis,
+                entry.configuration.reset_soft_deadline_on_improvement,
             ) {
-                deadline_reached.store(true, std::sync::atomic::Ordering::Release);
-                interrupt.set();
-                return;
+                entry
+                    .deadline_reached
+                    .store(true, std::sync::atomic::Ordering::Release);
+                entry.interrupt.set();
+                expired.push(id);
+            } else if let Some(wait_millis) = entry.tracker.next_wake_millis(
+                elapsed_millis,
+                complete_solution,
+                entry.configuration.soft_millis,
+                entry.configuration.hard_millis,
+                entry.configuration.reset_soft_deadline_on_improvement,
+            ) {
+                next_wake_millis = Some(
+                    next_wake_millis.map_or(wait_millis, |current: u64| current.min(wait_millis)),
+                );
             }
         }
-    });
-    (done_tx, Some(worker))
+        for id in expired {
+            state.entries.remove(&id);
+        }
+        if state.entries.is_empty() {
+            continue;
+        }
+        state = if let Some(wait_millis) = next_wake_millis {
+            shared
+                .wake
+                .wait_timeout(state, std::time::Duration::from_millis(wait_millis))
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0
+        } else {
+            shared
+                .wake
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+    }
 }
 
 fn configure_solver_workers() {
@@ -1442,6 +1686,11 @@ pub extern "C" fn donatello_cache_clear() {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = SolverCache::default();
     }
+    if let Some(cache) = GABRIEL_PLANNER_CACHE.get() {
+        *cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = GabrielPlannerCache::default();
+    }
 }
 
 #[cfg(test)]
@@ -1541,6 +1790,7 @@ mod tests {
             "maxDecisions": 64,
             "samples": 0,
             "seed": 1,
+            "sessionId": 1,
             "root": root
         }))
         .unwrap()
@@ -1883,10 +2133,10 @@ mod tests {
     #[test]
     fn soft_deadline_without_completion_waits_for_hard_timeout() {
         let interrupt = AtomicFlag::new();
-        let improved_solution = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let improved_solution = Arc::new(SolveProgressSignal::new());
+        let completed = Arc::new(SolveProgressSignal::new());
         let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (done, worker) = start_deadline_worker(
+        let registration = register_deadline(
             interrupt.clone(),
             improved_solution,
             completed,
@@ -1900,8 +2150,55 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(25));
         assert!(interrupt.is_set());
         assert!(reached.load(std::sync::atomic::Ordering::Acquire));
-        drop(done);
-        worker.unwrap().join().unwrap();
+        drop(registration);
+    }
+
+    #[test]
+    fn resettable_soft_deadline_wakes_on_completion_and_improvement() {
+        let interrupt = AtomicFlag::new();
+        let improved_solution = Arc::new(SolveProgressSignal::new());
+        let completed = Arc::new(SolveProgressSignal::new());
+        let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let registration = register_deadline(
+            interrupt.clone(),
+            Arc::clone(&improved_solution),
+            Arc::clone(&completed),
+            Arc::clone(&reached),
+            60,
+            250,
+            true,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        completed.store(true, Ordering::Release);
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        assert!(!interrupt.is_set());
+        improved_solution.store(true, Ordering::Release);
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        assert!(!interrupt.is_set());
+        std::thread::sleep(std::time::Duration::from_millis(35));
+        assert!(interrupt.is_set());
+        assert!(reached.load(Ordering::Acquire));
+        drop(registration);
+    }
+
+    #[test]
+    fn deadline_registrations_share_one_scheduler_thread() {
+        let registration = |interrupt: AtomicFlag| {
+            register_deadline(
+                interrupt,
+                Arc::new(SolveProgressSignal::new()),
+                Arc::new(SolveProgressSignal::new()),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                1_000,
+                2_000,
+                true,
+            )
+        };
+        let first = registration(AtomicFlag::new());
+        let second = registration(AtomicFlag::new());
+        assert_eq!(DEADLINE_SCHEDULER_STARTS.load(Ordering::Relaxed), 1);
+        drop(first);
+        drop(second);
     }
 
     #[test]

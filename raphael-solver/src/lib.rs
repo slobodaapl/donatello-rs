@@ -10,7 +10,7 @@ mod step_lower_bound_solver;
 use step_lower_bound_solver::StepLbSolver;
 
 mod macro_solver;
-pub use macro_solver::{MacroSolveOutcome, MacroSolver, MacroSolverStats};
+pub use macro_solver::{MacroSolveOutcome, MacroSolver, MacroSolverStats, SolveProgressSignal};
 
 mod progress_frontier_solver;
 pub use progress_frontier_solver::{

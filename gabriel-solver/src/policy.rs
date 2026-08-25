@@ -1,10 +1,10 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use raphael_sim::{Action, Combo, Condition};
 use raphael_solver::stochastic_policy::{
-    DecisionState as StochasticDecisionState, StochasticPolicySolver,
+    DecisionState as StochasticDecisionState, StochasticPolicyCache, StochasticPolicySolver,
 };
 use rayon::prelude::*;
 use rayon::{ThreadPool, ThreadPoolBuilder};
@@ -166,6 +166,117 @@ struct TreeNode {
     actions: [TreeAction; ACTION_COUNT],
 }
 
+#[derive(Default)]
+struct TreeSearchCache {
+    nodes: HashMap<State, TreeNode>,
+    successors: HashMap<(State, usize), Vec<State>>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedRecommendation {
+    state: State,
+    seed: u64,
+    recommendation: Recommendation,
+}
+
+#[derive(Default)]
+pub struct GabrielPlanner {
+    model: Option<RecipeModel>,
+    previous_root: Option<State>,
+    previous_action: Option<usize>,
+    cached_recommendation: Option<CachedRecommendation>,
+    tree_search: TreeSearchCache,
+    stochastic: StochasticPolicyCache,
+}
+
+impl GabrielPlanner {
+    fn begin_recommendation(
+        &mut self,
+        model: &RecipeModel,
+        state: State,
+        seed: u64,
+    ) -> Option<Recommendation> {
+        if self.model != Some(*model) {
+            *self = Self {
+                model: Some(*model),
+                ..Self::default()
+            };
+        }
+        if let Some(cached) = self.cached_recommendation
+            && cached.state == state
+            && cached.seed == seed
+        {
+            return Some(cached.recommendation);
+        }
+        if self.previous_root != Some(state) {
+            let expected = self
+                .previous_root
+                .zip(self.previous_action)
+                .is_some_and(|(root, action)| expected_successor(model, root, action, state));
+            if expected {
+                self.tree_search.retain_reachable(state);
+            } else {
+                self.tree_search.clear();
+            }
+        }
+        None
+    }
+
+    fn finish_recommendation(&mut self, state: State, seed: u64, recommendation: Recommendation) {
+        self.previous_root = Some(state);
+        self.previous_action = ACTIONS
+            .iter()
+            .position(|action| *action == recommendation.action);
+        self.cached_recommendation = Some(CachedRecommendation {
+            state,
+            seed,
+            recommendation,
+        });
+    }
+}
+
+impl TreeSearchCache {
+    fn clear(&mut self) {
+        self.nodes.clear();
+        self.successors.clear();
+    }
+
+    fn record_successor(&mut self, state: State, action: usize, successor: State) {
+        let successors = self.successors.entry((state, action)).or_default();
+        if !successors.contains(&successor) {
+            successors.push(successor);
+        }
+    }
+
+    fn retain_reachable(&mut self, root: State) {
+        if !self.nodes.contains_key(&root) {
+            self.clear();
+            return;
+        }
+        let mut reachable = HashSet::from([root]);
+        let mut pending = VecDeque::from([root]);
+        while let Some(state) = pending.pop_front() {
+            for action in 0..ACTION_COUNT {
+                if let Some(successors) = self.successors.get(&(state, action)) {
+                    for successor in successors {
+                        if reachable.insert(*successor) {
+                            pending.push_back(*successor);
+                        }
+                    }
+                }
+            }
+        }
+        self.nodes.retain(|state, _| reachable.contains(state));
+        self.successors.retain(|(state, _), successors| {
+            if !reachable.contains(state) {
+                return false;
+            }
+            successors.retain(|successor| reachable.contains(successor));
+            !successors.is_empty()
+        });
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ConditionOpportunity {
     tier: u8,
@@ -188,6 +299,17 @@ pub fn recommend_with_worker_threads(
     seed: u64,
     worker_threads: usize,
 ) -> Result<Recommendation, String> {
+    let mut planner = GabrielPlanner::default();
+    recommend_with_worker_threads_and_planner(model, state, seed, worker_threads, &mut planner)
+}
+
+pub fn recommend_with_worker_threads_and_planner(
+    model: &RecipeModel,
+    state: State,
+    seed: u64,
+    worker_threads: usize,
+    planner: &mut GabrielPlanner,
+) -> Result<Recommendation, String> {
     model.validate()?;
     match model.status(state) {
         TerminalStatus::Horizon if failure_closure_legal(model, state) => {
@@ -207,7 +329,7 @@ pub fn recommend_with_worker_threads(
         }
     }
     let actor = ActorModel::bundled()?;
-    pool(worker_threads)?.install(|| recommend_with_actor(model, state, seed, actor))
+    pool(worker_threads)?.install(|| recommend_with_actor(model, state, seed, actor, planner))
 }
 
 pub fn estimate_full_quality_probability(
@@ -302,9 +424,11 @@ fn simulate_policy(
     actor: &ActorModel,
 ) -> Result<State, String> {
     let mut stream = CounterStream::new(game_seed);
+    let mut planner = GabrielPlanner::default();
     while model.status(state) == TerminalStatus::Active {
         let decision_seed = derive_seed(policy_seed, u64::from(state.decisions));
-        let recommendation = recommend_with_actor(model, state, decision_seed, actor)?;
+        let recommendation =
+            recommend_with_actor(model, state, decision_seed, actor, &mut planner)?;
         state = model
             .apply_counter(state, recommendation.action, &mut stream)
             .map_err(|error| format!("Gabriel policy produced an unusable action: {error:?}"))?;
@@ -317,6 +441,22 @@ fn recommend_with_actor(
     state: State,
     seed: u64,
     actor: &ActorModel,
+    planner: &mut GabrielPlanner,
+) -> Result<Recommendation, String> {
+    if let Some(recommendation) = planner.begin_recommendation(model, state, seed) {
+        return Ok(recommendation);
+    }
+    let recommendation = compute_recommendation_with_actor(model, state, seed, actor, planner)?;
+    planner.finish_recommendation(state, seed, recommendation);
+    Ok(recommendation)
+}
+
+fn compute_recommendation_with_actor(
+    model: &RecipeModel,
+    state: State,
+    seed: u64,
+    actor: &ActorModel,
+    planner: &mut GabrielPlanner,
 ) -> Result<Recommendation, String> {
     if let Some(action) = immediate_progress_finish(model, state) {
         return Ok(Recommendation {
@@ -387,7 +527,8 @@ fn recommend_with_actor(
         };
     if TREE_SEARCH_ENABLED
         && tree_search_worthwhile(model, state)
-        && let Some((tree_action, _, tree_rollouts)) = tree_search_action(model, state, seed, actor)
+        && let Some((tree_action, _, tree_rollouts)) =
+            tree_search_action(model, state, seed, actor, &mut planner.tree_search)
     {
         rollout_count += tree_rollouts;
         if tree_action != action {
@@ -424,7 +565,7 @@ fn recommend_with_actor(
         }
     }
     action = preserve_active_innovation(model, state, action, actor);
-    action = bounded_policy_improvement_action(model, state, action, actor);
+    action = bounded_policy_improvement_action(model, state, action, actor, planner);
     action = urgent_pliant_durability_recovery(model, state, action);
     action = late_mend_efficiency_override(model, state, action);
     Ok(Recommendation {
@@ -473,6 +614,7 @@ fn bounded_policy_improvement_action(
     state: State,
     incumbent: usize,
     actor: &ActorModel,
+    planner: &mut GabrielPlanner,
 ) -> usize {
     if state.step < BOUNDED_POLICY_IMPROVEMENT_MIN_STEP {
         return incumbent;
@@ -481,34 +623,38 @@ fn bounded_policy_improvement_action(
         return action;
     }
     if !matches!(
-            state.condition,
-            Condition::Good
-                | Condition::Excellent
-                | Condition::Sturdy
-                | Condition::Pliant
-                | Condition::Malleable
-                | Condition::Primed
-                | Condition::Robust
-        ) {
+        state.condition,
+        Condition::Good
+            | Condition::Excellent
+            | Condition::Sturdy
+            | Condition::Pliant
+            | Condition::Malleable
+            | Condition::Primed
+            | Condition::Robust
+    ) {
         return incumbent;
     }
     let root = stochastic_decision_state(state);
-    let mut solver = match StochasticPolicySolver::new(
+    let persistent_cache = std::mem::take(&mut planner.stochastic);
+    let mut solver = match StochasticPolicySolver::new_with_cache(
         model.stochastic_model(),
         model.required_quality,
         ACTIONS,
         BOUNDED_POLICY_IMPROVEMENT_EXPANSION_LIMIT,
+        persistent_cache,
     ) {
         Ok(solver) => solver,
         Err(_) => return incumbent,
     };
-    let outcome = match solver.improve_policy_full_quality_best_first_bounded(root, &|decision| {
+    let outcome = solver.improve_policy_full_quality_best_first_bounded(root, &|decision| {
         if decision == root {
             return Some(ACTIONS[incumbent]);
         }
         bounded_continuation_action(model, gabriel_state(decision), actor)
             .map(|action| ACTIONS[action])
-    }) {
+    });
+    planner.stochastic = solver.into_cache();
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         _ => return incumbent,
     };
@@ -583,6 +729,20 @@ fn gabriel_state(state: StochasticDecisionState) -> State {
     }
 }
 
+fn expected_successor(model: &RecipeModel, root: State, action: usize, observed: State) -> bool {
+    let stochastic = model.stochastic_model();
+    stochastic
+        .post_decision_outcomes(stochastic_decision_state(root), ACTIONS[action])
+        .is_ok_and(|outcomes| {
+            outcomes.into_iter().any(|outcome| {
+                stochastic
+                    .condition_outcomes(outcome.value)
+                    .into_iter()
+                    .any(|condition| gabriel_state(condition.value) == observed)
+            })
+        })
+}
+
 fn preserve_active_innovation(
     model: &RecipeModel,
     state: State,
@@ -634,9 +794,15 @@ fn tree_search_action(
     root: State,
     seed: u64,
     actor: &ActorModel,
+    cache: &mut TreeSearchCache,
 ) -> Option<(usize, usize, usize)> {
-    let root_node = TreeNode::new(model, root, actor);
-    let candidate_count = root_node
+    cache
+        .nodes
+        .entry(root)
+        .or_insert_with(|| TreeNode::new(model, root, actor));
+    let candidate_count = cache
+        .nodes
+        .get(&root)?
         .actions
         .iter()
         .filter(|action| action.legal)
@@ -644,8 +810,6 @@ fn tree_search_action(
     if candidate_count == 0 {
         return None;
     }
-    let mut tree = HashMap::new();
-    tree.insert(root, root_node);
     let mut path = Vec::with_capacity(TREE_SEARCH_DEPTH);
 
     for simulation in 0..TREE_SEARCH_SIMULATIONS {
@@ -660,18 +824,21 @@ fn tree_search_action(
                 reward = Some(terminal_utility(model, state) / FULL_QUALITY_COMPLETION_UTILITY);
                 break;
             }
-            if !tree.contains_key(&state) {
-                tree.insert(state, TreeNode::new(model, state, actor));
+            if let std::collections::hash_map::Entry::Vacant(entry) = cache.nodes.entry(state) {
+                entry.insert(TreeNode::new(model, state, actor));
                 reward = Some(
                     continuation_utility(model, state, &mut stream, actor)
                         / FULL_QUALITY_COMPLETION_UTILITY,
                 );
                 break;
             }
-            let action = tree.get(&state)?.select_action()?;
+            let action = cache.nodes.get(&state)?.select_action()?;
             path.push((state, action));
             match model.apply_counter(state, ACTIONS[action], &mut stream) {
-                Ok(next) => state = next,
+                Ok(next) => {
+                    cache.record_successor(state, action, next);
+                    state = next;
+                }
                 Err(_) => {
                     reward = Some(-1.0);
                     break;
@@ -682,7 +849,7 @@ fn tree_search_action(
             continuation_utility(model, state, &mut stream, actor) / FULL_QUALITY_COMPLETION_UTILITY
         });
         for (state, action) in path.iter().copied() {
-            let node = tree.get_mut(&state)?;
+            let node = cache.nodes.get_mut(&state)?;
             node.visits = node.visits.saturating_add(1);
             let action = &mut node.actions[action];
             action.visits = action.visits.saturating_add(1);
@@ -690,7 +857,7 @@ fn tree_search_action(
         }
     }
 
-    let root_node = tree.get(&root)?;
+    let root_node = cache.nodes.get(&root)?;
     let action = (0..ACTION_COUNT)
         .filter(|action| root_node.actions[*action].legal)
         .max_by(|left, right| {
@@ -782,7 +949,7 @@ fn policy_improvement_action(
             "Gabriel policy improvement found no legal candidate",
         ));
     }
-    let incumbent = shielded_actor_action_finish(model, state, actor)
+    let incumbent = shielded_actor_action_from_evaluation(model, state, &candidates, &actor_scores)
         .ok_or_else(|| String::from("Gabriel actor found no legal incumbent action"))?;
     let condition_prior = condition_prior_action(model, state, &candidates, &actor_scores);
     let candidate_count = candidates.len();
@@ -1008,8 +1175,12 @@ fn condition_aware_actor_action(
     state: State,
     actor: &ActorModel,
 ) -> Option<usize> {
-    let incumbent = shielded_actor_action_finish(model, state, actor)?;
+    if let Some(action) = immediate_progress_finish(model, state) {
+        return Some(action);
+    }
     let (candidates, actor_scores) = candidate_actions(model, state, actor);
+    let incumbent =
+        shielded_actor_action_from_evaluation(model, state, &candidates, &actor_scores)?;
     condition_prior_action(model, state, &candidates, &actor_scores).or(Some(incumbent))
 }
 
@@ -1384,6 +1555,7 @@ fn best_good_followup_opportunity(model: &RecipeModel, state: State) -> f32 {
         .unwrap_or(0.0)
 }
 
+#[cfg(test)]
 fn shielded_actor_action_finish(
     model: &RecipeModel,
     state: State,
@@ -1392,11 +1564,18 @@ fn shielded_actor_action_finish(
     if let Some(action) = immediate_progress_finish(model, state) {
         return Some(action);
     }
-    let action = actor_safety_override(
-        model,
-        state,
-        byregot_override(model, state, raw_actor_action(model, state, actor)?),
-    );
+    let (candidates, actor_scores) = candidate_actions(model, state, actor);
+    shielded_actor_action_from_evaluation(model, state, &candidates, &actor_scores)
+}
+
+fn shielded_actor_action_from_evaluation(
+    model: &RecipeModel,
+    state: State,
+    candidates: &[usize],
+    actor_scores: &[f32; ACTION_COUNT],
+) -> Option<usize> {
+    let raw_action = first_max_action(candidates.iter().copied(), |action| actor_scores[action])?;
+    let action = actor_safety_override(model, state, byregot_override(model, state, raw_action));
     Some(protect_subquality_completion(model, state, action))
 }
 
@@ -1458,15 +1637,6 @@ fn actor_safety_override(model: &RecipeModel, state: State, action: usize) -> us
     action
 }
 
-fn raw_actor_action(model: &RecipeModel, state: State, actor: &ActorModel) -> Option<usize> {
-    let scratch = scratch(model, state);
-    let logits = actor.logits(&features(model, state));
-    first_max_action(
-        (0..ACTION_COUNT).filter(|action| scratch.legal[*action]),
-        |action| logits[action],
-    )
-}
-
 fn first_max_action<I, F>(mut actions: I, score: F) -> Option<usize>
 where
     I: Iterator<Item = usize>,
@@ -1523,10 +1693,11 @@ fn byregot_override(model: &RecipeModel, state: State, base_action: usize) -> us
     if state.simulation.effects.great_strides() == 0 && planner_legal(model, state, GREAT_STRIDES) {
         return GREAT_STRIDES;
     }
-    if state.simulation.effects.great_strides() > 0 && state.simulation.effects.innovation() == 0 {
-        if planner_legal(model, state, INNOVATION) {
-            return INNOVATION;
-        }
+    if state.simulation.effects.great_strides() > 0
+        && state.simulation.effects.innovation() == 0
+        && planner_legal(model, state, INNOVATION)
+    {
+        return INNOVATION;
     }
     if state.simulation.effects.great_strides() > 0 && state.simulation.effects.innovation() > 0 {
         if state.condition == Condition::Good && planner_legal(model, state, BYREGOT) {
@@ -1973,6 +2144,97 @@ mod tests {
                 .apply_outcome(state, recommendation.action, true, 0.0)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn planner_retains_only_the_observed_reachable_subtree() {
+        let (model, root) = fixture();
+        let action = HASTY_TOUCH;
+        let successor = model
+            .apply_outcome(root, ACTIONS[action], true, 0.0)
+            .unwrap();
+        let unrelated = model
+            .apply_outcome(root, ACTIONS[MASTERS_MEND], true, 0.0)
+            .unwrap();
+        let node = || TreeNode {
+            visits: 0,
+            actions: [TreeAction::default(); ACTION_COUNT],
+        };
+        let mut planner = GabrielPlanner {
+            model: Some(model),
+            previous_root: Some(root),
+            previous_action: Some(action),
+            ..GabrielPlanner::default()
+        };
+        planner.tree_search.nodes.insert(root, node());
+        planner.tree_search.nodes.insert(successor, node());
+        planner.tree_search.nodes.insert(unrelated, node());
+        planner
+            .tree_search
+            .record_successor(root, action, successor);
+
+        assert!(planner.begin_recommendation(&model, successor, 2).is_none());
+        assert_eq!(planner.tree_search.nodes.len(), 1);
+        assert!(planner.tree_search.nodes.contains_key(&successor));
+    }
+
+    #[test]
+    fn planner_discards_tree_on_manual_state_or_model_mismatch() {
+        let (model, root) = fixture();
+        let node = || TreeNode {
+            visits: 0,
+            actions: [TreeAction::default(); ACTION_COUNT],
+        };
+        let mut planner = GabrielPlanner {
+            model: Some(model),
+            previous_root: Some(root),
+            previous_action: Some(BASIC_SYNTHESIS),
+            ..GabrielPlanner::default()
+        };
+        planner.tree_search.nodes.insert(root, node());
+        let mut manually_changed = root;
+        manually_changed.simulation.quality = 1;
+        assert!(
+            planner
+                .begin_recommendation(&model, manually_changed, 2)
+                .is_none()
+        );
+        assert!(planner.tree_search.nodes.is_empty());
+
+        planner.tree_search.nodes.insert(root, node());
+        let mut changed_model = model;
+        changed_model.max_steps += 1;
+        assert!(
+            planner
+                .begin_recommendation(&changed_model, root, 3)
+                .is_none()
+        );
+        assert!(planner.tree_search.nodes.is_empty());
+        assert_eq!(planner.model, Some(changed_model));
+    }
+
+    #[test]
+    fn planner_reuses_an_exact_root_and_seed_recommendation() {
+        let (model, root) = fixture();
+        let recommendation = Recommendation {
+            action: Action::BasicTouch,
+            planned: true,
+            failure_closure: false,
+            candidate_count: 7,
+            rollout_count: 11,
+        };
+        let mut planner = GabrielPlanner {
+            model: Some(model),
+            ..GabrielPlanner::default()
+        };
+        planner.finish_recommendation(root, 4, recommendation);
+
+        let cached = planner.begin_recommendation(&model, root, 4).unwrap();
+        assert_eq!(cached.action, recommendation.action);
+        assert_eq!(cached.planned, recommendation.planned);
+        assert_eq!(cached.failure_closure, recommendation.failure_closure);
+        assert_eq!(cached.candidate_count, recommendation.candidate_count);
+        assert_eq!(cached.rollout_count, recommendation.rollout_count);
     }
 
     #[test]

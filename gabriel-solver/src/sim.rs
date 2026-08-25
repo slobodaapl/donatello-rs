@@ -20,7 +20,7 @@ pub struct State {
     pub decisions: u8,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RecipeModel {
     pub settings: Settings,
     pub required_quality: u16,

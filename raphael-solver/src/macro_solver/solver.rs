@@ -20,8 +20,8 @@ use crate::{
 };
 
 use smallvec::{SmallVec, smallvec};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::vec::Vec;
 use strum::IntoEnumIterator;
 
@@ -64,6 +64,55 @@ pub struct MacroSolveOutcome {
     pub stats: MacroSolverStats,
 }
 
+pub struct SolveProgressSignal {
+    value: AtomicBool,
+    notifier: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl Default for SolveProgressSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SolveProgressSignal {
+    pub fn new() -> Self {
+        Self {
+            value: AtomicBool::new(false),
+            notifier: Mutex::new(None),
+        }
+    }
+
+    pub fn load(&self, ordering: Ordering) -> bool {
+        self.value.load(ordering)
+    }
+
+    pub fn store(&self, value: bool, ordering: Ordering) {
+        self.value.store(value, ordering);
+        if value {
+            let notifier = self
+                .notifier
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(notifier) = notifier {
+                notifier();
+            }
+        }
+    }
+
+    pub fn swap(&self, value: bool, ordering: Ordering) -> bool {
+        self.value.swap(value, ordering)
+    }
+
+    pub fn set_notifier(&self, notifier: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self
+            .notifier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = notifier;
+    }
+}
+
 pub struct MacroSolver<'a> {
     settings: SolverSettings,
     solution_callback: Box<SolutionCallback<'a>>,
@@ -73,8 +122,8 @@ pub struct MacroSolver<'a> {
     step_lb_solver: StepLbSolver,
     interrupt_signal: AtomicFlag,
     last_solve_runtime_stats: MacroSolverStats,
-    improved_solution_found: Arc<AtomicBool>,
-    complete_solution_found: Arc<AtomicBool>,
+    improved_solution_found: Arc<SolveProgressSignal>,
+    complete_solution_found: Arc<SolveProgressSignal>,
     progress_frontier_cache: Option<ProgressFrontierCache>,
 }
 
@@ -153,8 +202,8 @@ impl<'a> MacroSolver<'a> {
             step_lb_solver,
             interrupt_signal,
             last_solve_runtime_stats: MacroSolverStats::default(),
-            improved_solution_found: Arc::new(AtomicBool::new(false)),
-            complete_solution_found: Arc::new(AtomicBool::new(false)),
+            improved_solution_found: Arc::new(SolveProgressSignal::new()),
+            complete_solution_found: Arc::new(SolveProgressSignal::new()),
             progress_frontier_cache: None,
         }
     }
@@ -173,11 +222,11 @@ impl<'a> MacroSolver<'a> {
             .set_interrupt_signal(self.interrupt_signal.clone());
     }
 
-    pub fn improved_solution_signal(&self) -> Arc<AtomicBool> {
+    pub fn improved_solution_signal(&self) -> Arc<SolveProgressSignal> {
         self.improved_solution_found.clone()
     }
 
-    pub fn complete_solution_signal(&self) -> Arc<AtomicBool> {
+    pub fn complete_solution_signal(&self) -> Arc<SolveProgressSignal> {
         self.complete_solution_found.clone()
     }
 

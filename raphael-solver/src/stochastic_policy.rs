@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -68,6 +69,54 @@ impl OptimisticFrontierCache {
 
 static OPTIMISTIC_FRONTIER_CACHE: OnceLock<Mutex<OptimisticFrontierCache>> = OnceLock::new();
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StochasticPolicyCacheIdentity {
+    model: StochasticModel,
+    required_quality: u16,
+    actions: Box<[Action]>,
+}
+
+#[derive(Default)]
+pub struct StochasticPolicyCache {
+    identity: Option<StochasticPolicyCacheIdentity>,
+    action_outcomes: FxHashMap<(DecisionState, Action), Arc<[Weighted<PostDecisionState>]>>,
+    condition_outcomes: FxHashMap<PostDecisionState, Arc<[Weighted<DecisionState>]>>,
+    action_upper_bounds: FxHashMap<(DecisionState, Action), PolicyValue>,
+    decision_upper_bounds: FxHashMap<DecisionState, PolicyValue>,
+    post_decision_upper_bounds: FxHashMap<PostDecisionState, PolicyValue>,
+}
+
+impl StochasticPolicyCache {
+    fn prepare(
+        &mut self,
+        model: StochasticModel,
+        required_quality: u16,
+        actions: &[Action],
+        expansion_limit: usize,
+    ) {
+        let identity = StochasticPolicyCacheIdentity {
+            model,
+            required_quality,
+            actions: actions.into(),
+        };
+        let retained_limit = expansion_limit.saturating_mul(8);
+        if self.identity.as_ref() != Some(&identity) || self.entry_count() > retained_limit {
+            *self = Self {
+                identity: Some(identity),
+                ..Self::default()
+            };
+        }
+    }
+
+    fn entry_count(&self) -> usize {
+        self.action_outcomes.len()
+            + self.condition_outcomes.len()
+            + self.action_upper_bounds.len()
+            + self.decision_upper_bounds.len()
+            + self.post_decision_upper_bounds.len()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DecisionState {
     pub simulation: SimulationState,
@@ -131,7 +180,7 @@ pub struct Weighted<T> {
     pub probability: f64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StochasticModel {
     pub settings: Settings,
     pub condition_probabilities_bps: [u16; CONDITION_COUNT],
@@ -299,6 +348,7 @@ pub struct StochasticPolicySolver {
     bounded_post_decision_values: FxHashMap<PostDecisionState, ProbabilityInterval>,
     stats: StochasticSolveStats,
     optimistic_supported_step_frontiers: Arc<OptimisticStepFrontiers>,
+    persistent_cache: RefCell<StochasticPolicyCache>,
 }
 
 impl StochasticPolicySolver {
@@ -307,6 +357,22 @@ impl StochasticPolicySolver {
         required_quality: u16,
         actions: impl Into<Box<[Action]>>,
         expansion_limit: usize,
+    ) -> Result<Self, String> {
+        Self::new_with_cache(
+            model,
+            required_quality,
+            actions,
+            expansion_limit,
+            StochasticPolicyCache::default(),
+        )
+    }
+
+    pub fn new_with_cache(
+        model: StochasticModel,
+        required_quality: u16,
+        actions: impl Into<Box<[Action]>>,
+        expansion_limit: usize,
+        mut persistent_cache: StochasticPolicyCache,
     ) -> Result<Self, String> {
         model.validate()?;
         if required_quality == 0 || required_quality > model.settings.max_quality {
@@ -318,10 +384,11 @@ impl StochasticPolicySolver {
             return Err(String::from("stochastic expansion limit must be positive"));
         }
         let actions = actions.into();
+        persistent_cache.prepare(model, required_quality, &actions, expansion_limit);
         let optimistic_supported_step_frontiers = OPTIMISTIC_FRONTIER_CACHE
             .get_or_init(|| Mutex::new(OptimisticFrontierCache::default()))
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get_or_build(&model, required_quality);
         Ok(Self {
             model,
@@ -338,7 +405,12 @@ impl StochasticPolicySolver {
             bounded_post_decision_values: FxHashMap::default(),
             stats: StochasticSolveStats::default(),
             optimistic_supported_step_frontiers,
+            persistent_cache: RefCell::new(persistent_cache),
         })
+    }
+
+    pub fn into_cache(self) -> StochasticPolicyCache {
+        self.persistent_cache.into_inner()
     }
 
     pub fn solve(
@@ -605,8 +677,7 @@ impl StochasticPolicySolver {
         let root_state = PolicyFrontierState::Decision(root);
         let mut nodes = Vec::new();
         let mut node_indices = FxHashMap::default();
-        let root_index =
-            self.bounded_graph_node(root_state, &mut nodes, &mut node_indices, policy);
+        let root_index = self.bounded_graph_node(root_state, &mut nodes, &mut node_indices, policy);
         self.expand_bounded_graph_node(root_index, &mut nodes, &mut node_indices, policy)?;
 
         const EXPANSION_BATCH: usize = 4_096;
@@ -786,18 +857,40 @@ impl StochasticPolicySolver {
         state: DecisionState,
         action: Action,
     ) -> Result<PolicyValue, ActionError> {
+        if let Some(value) = self
+            .persistent_cache
+            .borrow()
+            .action_upper_bounds
+            .get(&(state, action))
+            .copied()
+        {
+            return Ok(value);
+        }
         let mut value = PolicyValue::default();
-        for outcome in self.model.post_decision_outcomes(state, action)? {
+        for outcome in self.post_decision_outcomes_cached(state, action)?.iter() {
             value.add_assign(
                 self.post_decision_upper_bound(outcome.value)
                     .scaled(outcome.probability),
             );
         }
+        self.persistent_cache
+            .borrow_mut()
+            .action_upper_bounds
+            .insert((state, action), value);
         Ok(value)
     }
 
     fn post_decision_upper_bound(&self, post: PostDecisionState) -> PolicyValue {
-        match post.transition {
+        if let Some(value) = self
+            .persistent_cache
+            .borrow()
+            .post_decision_upper_bounds
+            .get(&post)
+            .copied()
+        {
+            return value;
+        }
+        let value = match post.transition {
             ConditionTransition::Random => self.state_upper_bound(
                 post.simulation,
                 post.step,
@@ -810,37 +903,98 @@ impl StochasticPolicySolver {
                 step: post.step,
                 decisions: post.decisions,
             }),
-        }
+        };
+        self.persistent_cache
+            .borrow_mut()
+            .post_decision_upper_bounds
+            .insert(post, value);
+        value
     }
 
     fn decision_upper_bound(&self, state: DecisionState) -> PolicyValue {
+        if let Some(value) = self
+            .persistent_cache
+            .borrow()
+            .decision_upper_bounds
+            .get(&state)
+            .copied()
+        {
+            return value;
+        }
         if let Some(value) = self.terminal_value(state.simulation, state.step, state.decisions) {
             return value;
         }
-        if self.model.condition_probabilities_bps[condition_index(state.condition)] != 0 {
-            return self.state_upper_bound(
+        let value = if self.model.condition_probabilities_bps[condition_index(state.condition)] != 0
+        {
+            self.state_upper_bound(
                 state.simulation,
                 state.step,
                 state.decisions,
                 &self.optimistic_supported_step_frontiers,
-            );
-        }
-        let mut upper = PolicyValue::default();
-        for action in
-            Action::iter().filter(|action| self.model.settings.allowed_actions.has(*action))
+            )
+        } else {
+            let mut upper = PolicyValue::default();
+            for action in
+                Action::iter().filter(|action| self.model.settings.allowed_actions.has(*action))
+            {
+                let Ok(action_upper) = self.action_upper_bound(state, action) else {
+                    continue;
+                };
+                upper.full_quality_completion_probability = upper
+                    .full_quality_completion_probability
+                    .max(action_upper.full_quality_completion_probability);
+                upper.completion_probability = upper
+                    .completion_probability
+                    .max(action_upper.completion_probability);
+                upper.expected_quality = upper.expected_quality.max(action_upper.expected_quality);
+            }
+            upper
+        };
+        self.persistent_cache
+            .borrow_mut()
+            .decision_upper_bounds
+            .insert(state, value);
+        value
+    }
+
+    fn post_decision_outcomes_cached(
+        &self,
+        state: DecisionState,
+        action: Action,
+    ) -> Result<Arc<[Weighted<PostDecisionState>]>, ActionError> {
+        if let Some(outcomes) = self
+            .persistent_cache
+            .borrow()
+            .action_outcomes
+            .get(&(state, action))
+            .cloned()
         {
-            let Ok(action_upper) = self.action_upper_bound(state, action) else {
-                continue;
-            };
-            upper.full_quality_completion_probability = upper
-                .full_quality_completion_probability
-                .max(action_upper.full_quality_completion_probability);
-            upper.completion_probability = upper
-                .completion_probability
-                .max(action_upper.completion_probability);
-            upper.expected_quality = upper.expected_quality.max(action_upper.expected_quality);
+            return Ok(outcomes);
         }
-        upper
+        let outcomes: Arc<[_]> = self.model.post_decision_outcomes(state, action)?.into();
+        self.persistent_cache
+            .borrow_mut()
+            .action_outcomes
+            .insert((state, action), Arc::clone(&outcomes));
+        Ok(outcomes)
+    }
+
+    fn condition_outcomes_cached(&self, post: PostDecisionState) -> Arc<[Weighted<DecisionState>]> {
+        if let Some(outcomes) = self
+            .persistent_cache
+            .borrow()
+            .condition_outcomes
+            .get(&post)
+            .cloned()
+        {
+            return outcomes;
+        }
+        let outcomes: Arc<[_]> = self.model.condition_outcomes(post).into();
+        self.persistent_cache
+            .borrow_mut()
+            .condition_outcomes
+            .insert(post, Arc::clone(&outcomes));
+        outcomes
     }
 
     fn state_upper_bound(
@@ -899,11 +1053,10 @@ impl StochasticPolicySolver {
         policy: Option<&dyn Fn(DecisionState) -> Option<Action>>,
     ) -> Result<PolicyValue, StochasticSolveError> {
         let outcomes = self
-            .model
-            .post_decision_outcomes(state, action)
+            .post_decision_outcomes_cached(state, action)
             .map_err(|_| StochasticSolveError::NoLegalAction)?;
         let mut value = PolicyValue::default();
-        for outcome in outcomes {
+        for outcome in outcomes.iter() {
             let branch = self.post_decision_value(outcome.value, policy)?;
             value.add_assign(branch.scaled(outcome.probability));
         }
@@ -923,7 +1076,7 @@ impl StochasticPolicySolver {
         }
         self.reserve_post_decision_state()?;
         let mut value = PolicyValue::default();
-        for outcome in self.model.condition_outcomes(post) {
+        for outcome in self.condition_outcomes_cached(post).iter() {
             let branch = self.decision_value(outcome.value, policy)?;
             value.add_assign(branch.scaled(outcome.probability));
         }
@@ -1032,9 +1185,9 @@ impl StochasticPolicySolver {
     ) -> Result<ProbabilityInterval, StochasticSolveError> {
         let mut interval = ProbabilityInterval::exact(0.0);
         for outcome in self
-            .model
-            .post_decision_outcomes(state, action)
+            .post_decision_outcomes_cached(state, action)
             .map_err(|_| StochasticSolveError::NoLegalAction)?
+            .iter()
         {
             interval.add_assign(
                 self.bounded_recursive_post_decision_value(outcome.value, policy)?
@@ -1069,9 +1222,8 @@ impl StochasticPolicySolver {
         if self.total_states() >= self.expansion_limit {
             self.stats.deferred_policy_states += 1;
             let upper = self
-                .model
-                .condition_outcomes(post)
-                .into_iter()
+                .condition_outcomes_cached(post)
+                .iter()
                 .map(|outcome| {
                     outcome.probability
                         * self
@@ -1085,7 +1237,7 @@ impl StochasticPolicySolver {
         self.reserve_post_decision_state()?;
 
         let mut interval = ProbabilityInterval::exact(0.0);
-        for outcome in self.model.condition_outcomes(post) {
+        for outcome in self.condition_outcomes_cached(post).iter() {
             interval.add_assign(
                 self.bounded_recursive_decision_value(outcome.value, policy)?
                     .interval
@@ -1104,11 +1256,11 @@ impl StochasticPolicySolver {
         let Some(action) = self.policy_action(state, policy) else {
             return 0.0;
         };
-        let Ok(outcomes) = self.model.post_decision_outcomes(state, action) else {
+        let Ok(outcomes) = self.post_decision_outcomes_cached(state, action) else {
             return 0.0;
         };
         let mut lower = 0.0;
-        for outcome in outcomes {
+        for outcome in outcomes.iter() {
             let success = self
                 .terminal_value(
                     outcome.value.simulation,
@@ -1127,7 +1279,7 @@ impl StochasticPolicySolver {
         policy: &dyn Fn(DecisionState) -> Option<Action>,
     ) -> f64 {
         let mut lower = 0.0;
-        for outcome in self.model.condition_outcomes(post) {
+        for outcome in self.condition_outcomes_cached(post).iter() {
             lower += outcome.probability
                 * self.one_step_policy_decision_lower_bound(outcome.value, policy);
         }
@@ -1160,9 +1312,7 @@ impl StochasticPolicySolver {
         };
         let terminal = self.terminal_value(simulation, step, decisions);
         let interval = match terminal {
-            Some(value) => {
-                ProbabilityInterval::exact(value.full_quality_completion_probability)
-            }
+            Some(value) => ProbabilityInterval::exact(value.full_quality_completion_probability),
             None => ProbabilityInterval {
                 lower: match state {
                     PolicyFrontierState::Decision(state) => {
@@ -1218,9 +1368,9 @@ impl StochasticPolicySolver {
                 for action in actions {
                     let mut successors = Vec::new();
                     for outcome in self
-                        .model
-                        .post_decision_outcomes(state, action)
+                        .post_decision_outcomes_cached(state, action)
                         .map_err(|_| StochasticSolveError::NoLegalAction)?
+                        .iter()
                     {
                         let child = self.bounded_graph_node(
                             PolicyFrontierState::PostDecision(outcome.value),
@@ -1243,7 +1393,7 @@ impl StochasticPolicySolver {
             PolicyFrontierState::PostDecision(post) => {
                 self.reserve_post_decision_state()?;
                 let mut successors = Vec::new();
-                for outcome in self.model.condition_outcomes(post) {
+                for outcome in self.condition_outcomes_cached(post).iter() {
                     let child = self.bounded_graph_node(
                         PolicyFrontierState::Decision(outcome.value),
                         nodes,
@@ -1412,7 +1562,7 @@ impl StochasticPolicySolver {
         state: DecisionState,
         policy: &dyn Fn(DecisionState) -> Option<Action>,
     ) -> Option<Action> {
-        policy(state).filter(|action| self.model.post_decision_outcomes(state, *action).is_ok())
+        policy(state).filter(|action| self.post_decision_outcomes_cached(state, *action).is_ok())
     }
 
     fn policy_decision_value(
@@ -1444,9 +1594,9 @@ impl StochasticPolicySolver {
     ) -> Result<PolicyValue, StochasticSolveError> {
         let mut value = PolicyValue::default();
         for outcome in self
-            .model
-            .post_decision_outcomes(state, action)
+            .post_decision_outcomes_cached(state, action)
             .map_err(|_| StochasticSolveError::NoLegalAction)?
+            .iter()
         {
             let branch = self.policy_post_decision_value(outcome.value, policy)?;
             value.add_assign(branch.scaled(outcome.probability));
@@ -1467,7 +1617,7 @@ impl StochasticPolicySolver {
         }
         self.reserve_policy_post_decision_state()?;
         let mut value = PolicyValue::default();
-        for outcome in self.model.condition_outcomes(post) {
+        for outcome in self.condition_outcomes_cached(post).iter() {
             let branch = self.policy_decision_value(outcome.value, policy)?;
             value.add_assign(branch.scaled(outcome.probability));
         }
@@ -1524,9 +1674,9 @@ impl StochasticPolicySolver {
     ) -> Result<f64, StochasticSolveError> {
         let mut probability = 0.0;
         for outcome in self
-            .model
-            .post_decision_outcomes(state, action)
+            .post_decision_outcomes_cached(state, action)
             .map_err(|_| StochasticSolveError::NoLegalAction)?
+            .iter()
         {
             probability += outcome.probability
                 * self.policy_full_quality_post_decision_probability(outcome.value, policy)?;
@@ -1557,7 +1707,7 @@ impl StochasticPolicySolver {
         }
         self.reserve_policy_post_decision_state()?;
         let mut probability = 0.0;
-        for outcome in self.model.condition_outcomes(post) {
+        for outcome in self.condition_outcomes_cached(post).iter() {
             probability += outcome.probability
                 * self.policy_full_quality_decision_probability(outcome.value, policy)?;
         }
@@ -1579,9 +1729,9 @@ impl StochasticPolicySolver {
         let mut sequence = 0;
         for (action_index, action) in root_actions.iter().copied().enumerate() {
             for outcome in self
-                .model
-                .post_decision_outcomes(root, action)
+                .post_decision_outcomes_cached(root, action)
                 .map_err(|_| StochasticSolveError::NoLegalAction)?
+                .iter()
             {
                 let mut masses = zero_probability_masses(action_count);
                 masses[action_index] = outcome.probability;
@@ -1617,7 +1767,7 @@ impl StochasticPolicySolver {
             match entry.state {
                 PolicyFrontierState::PostDecision(post) => {
                     self.reserve_policy_post_decision_state()?;
-                    for outcome in self.model.condition_outcomes(post) {
+                    for outcome in self.condition_outcomes_cached(post).iter() {
                         self.queue_policy_masses(
                             &mut frontier,
                             &mut queue,
@@ -1634,9 +1784,9 @@ impl StochasticPolicySolver {
                         continue;
                     };
                     for outcome in self
-                        .model
-                        .post_decision_outcomes(state, action)
+                        .post_decision_outcomes_cached(state, action)
                         .map_err(|_| StochasticSolveError::NoLegalAction)?
+                        .iter()
                     {
                         self.queue_policy_masses(
                             &mut frontier,
@@ -1971,7 +2121,7 @@ fn optimistic_step_frontiers(
     required_quality: u16,
     actions: &[Action],
     conditions: &[Condition],
-) -> Box<[Box<[Box<[ParetoValue]>]>]> {
+) -> OptimisticStepFrontiers {
     const COMBOS: [Combo; 4] = [
         Combo::None,
         Combo::SynthesisBegin,
@@ -2374,6 +2524,62 @@ mod tests {
         different_settings.max_steps += 1;
         let step_bound = cache.get_or_build(&different_settings, 101);
         assert!(!Arc::ptr_eq(&settings_bound, &step_bound));
+    }
+
+    #[test]
+    fn policy_independent_cache_survives_only_matching_solver_identity() {
+        let mut model = model();
+        model.settings.max_progress = 100;
+        model.settings.max_quality = 100;
+        model.settings.base_progress = 100;
+        model.settings.allowed_actions = ActionMask::none().add(Action::BasicSynthesis);
+        model.condition_probabilities_bps = [10_000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        model.max_steps = 2;
+        model.max_decisions = 2;
+        let root = DecisionState {
+            simulation: SimulationState::new(&model.settings),
+            condition: Condition::Normal,
+            step: 0,
+            decisions: 0,
+        };
+        let solver =
+            StochasticPolicySolver::new(model, 100, [Action::BasicSynthesis], 100).unwrap();
+        let post = solver
+            .post_decision_outcomes_cached(root, Action::BasicSynthesis)
+            .unwrap()[0]
+            .value;
+        solver.condition_outcomes_cached(post);
+        solver
+            .action_upper_bound(root, Action::BasicSynthesis)
+            .unwrap();
+        let retained_entries = solver.persistent_cache.borrow().entry_count();
+        assert!(retained_entries >= 3);
+
+        let solver = StochasticPolicySolver::new_with_cache(
+            model,
+            100,
+            [Action::BasicSynthesis],
+            100,
+            solver.into_cache(),
+        )
+        .unwrap();
+        assert_eq!(
+            solver.persistent_cache.borrow().entry_count(),
+            retained_entries
+        );
+
+        let mut changed_model = model;
+        changed_model.max_steps = 3;
+        changed_model.max_decisions = 3;
+        let solver = StochasticPolicySolver::new_with_cache(
+            changed_model,
+            100,
+            [Action::BasicSynthesis],
+            100,
+            solver.into_cache(),
+        )
+        .unwrap();
+        assert_eq!(solver.persistent_cache.borrow().entry_count(), 0);
     }
 
     #[test]

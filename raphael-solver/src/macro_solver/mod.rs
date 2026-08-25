@@ -2,7 +2,7 @@ mod pareto_front;
 mod search_queue;
 mod solver;
 
-pub use solver::{MacroSolveOutcome, MacroSolver, MacroSolverStats};
+pub use solver::{MacroSolveOutcome, MacroSolver, MacroSolverStats, SolveProgressSignal};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum FirstActionPreference {
