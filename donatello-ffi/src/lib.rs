@@ -16,7 +16,7 @@ use raphael_solver::{
 };
 use serde::{Deserialize, Serialize};
 
-const ABI_VERSION: u32 = 13;
+const ABI_VERSION: u32 = 14;
 const DEFAULT_CACHE_BUDGET: usize = 512 * 1024 * 1024;
 const DEFAULT_GABRIEL_WORKER_THREADS: usize = 4;
 const GABRIEL_PLANNER_CACHE_CAPACITY: usize = 16;
@@ -44,7 +44,74 @@ struct SolverCache {
 
 #[derive(Default)]
 struct GabrielPlannerCache {
-    entries: VecDeque<(u64, CachedGabrielPlanner)>,
+    entries: VecDeque<GabrielPlannerCacheEntry>,
+}
+
+struct GabrielPlannerCacheEntry {
+    session_id: u64,
+    planner: CachedGabrielPlanner,
+    pinned: bool,
+}
+
+impl GabrielPlannerCache {
+    fn open(&mut self, session_id: u64) {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.session_id == session_id)
+        {
+            let mut entry = self.entries.remove(index).unwrap();
+            entry.pinned = true;
+            self.entries.push_back(entry);
+            return;
+        }
+        self.entries.push_back(GabrielPlannerCacheEntry {
+            session_id,
+            planner: Arc::new(Mutex::new(gabriel_solver::GabrielPlanner::default())),
+            pinned: true,
+        });
+        self.trim_unpinned();
+    }
+
+    fn close(&mut self, session_id: u64) {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.session_id == session_id)
+        {
+            self.entries.remove(index);
+        }
+    }
+
+    fn planner(&mut self, session_id: u64) -> CachedGabrielPlanner {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.session_id == session_id)
+        {
+            let entry = self.entries.remove(index).unwrap();
+            let planner = Arc::clone(&entry.planner);
+            self.entries.push_back(entry);
+            return planner;
+        }
+        let planner = Arc::new(Mutex::new(gabriel_solver::GabrielPlanner::default()));
+        self.entries.push_back(GabrielPlannerCacheEntry {
+            session_id,
+            planner: Arc::clone(&planner),
+            pinned: false,
+        });
+        self.trim_unpinned();
+        planner
+    }
+
+    fn trim_unpinned(&mut self) {
+        while self.entries.len() > GABRIEL_PLANNER_CACHE_CAPACITY {
+            let Some(index) = self.entries.iter().position(|entry| !entry.pinned) else {
+                break;
+            };
+            self.entries.remove(index);
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -497,22 +564,7 @@ fn cached_gabriel_planner(session_id: u64) -> CachedGabrielPlanner {
         .get_or_init(|| Mutex::new(GabrielPlannerCache::default()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(index) = cache
-        .entries
-        .iter()
-        .position(|(cached_session_id, _)| *cached_session_id == session_id)
-    {
-        let entry = cache.entries.remove(index).unwrap();
-        let planner = Arc::clone(&entry.1);
-        cache.entries.push_back(entry);
-        return planner;
-    }
-    let planner = Arc::new(Mutex::new(gabriel_solver::GabrielPlanner::default()));
-    cache.entries.push_back((session_id, Arc::clone(&planner)));
-    if cache.entries.len() > GABRIEL_PLANNER_CACHE_CAPACITY {
-        cache.entries.pop_front();
-    }
-    planner
+    cache.planner(session_id)
 }
 
 fn gabriel_json(data: &[u8]) -> String {
@@ -1599,6 +1651,24 @@ pub unsafe extern "C" fn gabriel_solve_json(data: *const u8, len: usize) -> *mut
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn gabriel_session_open(session_id: u64) {
+    GABRIEL_PLANNER_CACHE
+        .get_or_init(|| Mutex::new(GabrielPlannerCache::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .open(session_id);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn gabriel_session_close(session_id: u64) {
+    GABRIEL_PLANNER_CACHE
+        .get_or_init(|| Mutex::new(GabrielPlannerCache::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .close(session_id);
+}
+
+#[unsafe(no_mangle)]
 /// # Safety
 /// `data` must be null or point to `len` readable bytes for the duration of the call.
 pub unsafe extern "C" fn donatello_solve_json(data: *const u8, len: usize) -> *mut c_char {
@@ -1696,6 +1766,28 @@ pub extern "C" fn donatello_cache_clear() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_gabriel_sessions_survive_capacity_pressure_until_closed() {
+        let mut cache = GabrielPlannerCache::default();
+        let pinned_count = GABRIEL_PLANNER_CACHE_CAPACITY + 4;
+        let mut planners = Vec::with_capacity(pinned_count);
+        for session_id in 1..=pinned_count as u64 {
+            cache.open(session_id);
+            planners.push(cache.planner(session_id));
+        }
+        for session_id in 10_000..10_000 + GABRIEL_PLANNER_CACHE_CAPACITY as u64 {
+            cache.planner(session_id);
+        }
+        assert_eq!(cache.entries.len(), pinned_count);
+        for (index, planner) in planners.iter().enumerate() {
+            assert!(Arc::ptr_eq(planner, &cache.planner(index as u64 + 1)));
+        }
+        for session_id in 1..=pinned_count as u64 {
+            cache.close(session_id);
+        }
+        assert!(cache.entries.is_empty());
+    }
 
     fn root_from_state(state: SimulationState, condition: Condition) -> RootState {
         RootState {
@@ -2406,7 +2498,7 @@ mod tests {
 
     #[test]
     fn abi_version_is_stable() {
-        assert_eq!(donatello_abi_version(), 13);
+        assert_eq!(donatello_abi_version(), 14);
     }
 
     #[test]
